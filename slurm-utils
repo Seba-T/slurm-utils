@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+fail() { printf 'slurm-utils: %s\n' "$*" >&2; exit 1; }
+help() {
+    cat <<'HELP'
+Usage: slurm-utils [--config PATH] schedule|status|connect|jupyter|cancel
+
+Track one Slurm allocation. Configuration defaults to
+~/.config/slurm-utils/config.sh (trusted Bash code).
+Existing allocations use saved settings, without loading configuration again.
+HELP
+}
+
+# These functions are copied into the submitted script; no installed executable
+# is required on the compute node.
+batch_main() {
+    local root scratch='' temp renewal='' sleeper=''
+    for root in "${SCRATCH_ROOTS[@]}"; do
+        if [[ -d $root && -w $root ]] &&
+            mkdir -p -- "$root/$LAUNCH_USER/$SLURM_JOB_ID"; then
+            scratch="$root/$LAUNCH_USER/$SLURM_JOB_ID"
+            [[ -w $scratch ]] && break
+            scratch=''
+        fi
+    done
+    [[ -n $scratch ]] || { echo 'No usable configured scratch root' >&2; exit 1; }
+    export SCRATCH_DIR=$scratch
+    temp=$(mktemp "$LAUNCH_DIR/.scratch.XXXXXX")
+    printf '%s\n' "$scratch" > "$temp"
+    mv -- "$temp" "$LAUNCH_DIR/scratch-$SLURM_JOB_ID"
+    # Invoked by the EXIT trap in the generated batch script.
+    # shellcheck disable=SC2329
+    cleanup() {
+        [[ -z $renewal ]] || kill "$renewal" 2>/dev/null || true
+        [[ -z $sleeper ]] || kill "$sleeper" 2>/dev/null || true
+    }
+    trap cleanup EXIT
+    trap 'exit 0' TERM INT
+    if [[ -n $KEYTAB && -f $KEYTAB ]] && command -v k5start >/dev/null; then
+        k5start -U -f "$KEYTAB" -K 60 -l 10h &
+        renewal=$!
+        sleep 1
+        if ! kill -0 "$renewal" 2>/dev/null; then
+            echo 'k5start renewal startup failed; continuing without renewal' >&2
+            wait "$renewal" || true
+            renewal=''
+        fi
+    fi
+    while :; do sleep 3600 & sleeper=$!; wait "$sleeper"; done
+}
+
+config="$HOME/.config/slurm-utils/config.sh"
+command_name=''
+while (($#)); do
+    case $1 in
+        --help|-h) help; exit 0 ;;
+        --config) (($# >= 2)) || fail '--config needs a path'; config=$2; shift 2 ;;
+        schedule|status|connect|jupyter|cancel)
+            [[ -z $command_name ]] || fail 'Specify one command'
+            command_name=$1; shift ;;
+        *) fail "Unknown argument: $1 (see --help)" ;;
+    esac
+done
+[[ -n $command_name ]] || { help; exit 1; }
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/slurm-utils"
+[[ $state_dir = /* ]] || fail 'State directory must be absolute'
+mkdir -p -- "$state_dir"
+[[ -O $state_dir && ! -L $state_dir ]] || fail 'State directory must be owned by you and not a symlink'
+chmod 700 -- "$state_dir"
+
+load_current() {
+    [[ -f $state_dir/current ]] || fail 'No current allocation; run slurm-utils schedule'
+    # shellcheck disable=SC1091
+    source "$state_dir/current"
+    [[ $JOB_ID =~ ^[0-9]+$ && $LAUNCH_DIR = "$state_dir/"* ]] || fail 'Invalid saved state'
+    # shellcheck disable=SC1091
+    source "$LAUNCH_DIR/settings.sh"
+}
+query() {
+    local output id state node
+    output=$(squeue --noheader --user "$(id -un)" --format='%i|%T|%N') ||
+        fail 'Slurm query failed; saved state preserved'
+    JOB_STATE=FINISHED
+    JOB_NODE=''
+    while IFS='|' read -r id state node; do
+        if [[ $id = "$JOB_ID" ]]; then JOB_STATE=$state; JOB_NODE=$node; break; fi
+    done <<< "$output"
+}
+finished() {
+    case $JOB_STATE in
+        FINISHED|COMPLETED|CANCELLED|FAILED|TIMEOUT|NODE_FAIL|OUT_OF_MEMORY|BOOT_FAIL|DEADLINE|PREEMPTED) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+validate_config() {
+    local name root declaration
+    for name in JOB_NAME PARTITION GRES CPUS_PER_TASK MEMORY TIME_LIMIT LOG_DIR SCRATCH_ROOTS JUPYTER_PORT; do
+        [[ ${!name+x} ]] || fail "Configuration must define $name (PARTITION and GRES may be empty)"
+    done
+    for name in JOB_NAME MEMORY TIME_LIMIT LOG_DIR; do
+        [[ -n ${!name} && ${!name} != *$'\n'* ]] || fail "Invalid $name"
+    done
+    [[ $CPUS_PER_TASK =~ ^[1-9][0-9]*$ ]] || fail 'CPUS_PER_TASK must be a positive integer'
+    [[ $MEMORY =~ ^[0-9]+([KkMmGgTt])?$ ]] || fail 'MEMORY must be a Slurm size, e.g. 16G'
+    [[ $TIME_LIMIT =~ ^[0-9]+(-[0-9]+)?(:[0-9]+){0,2}$ ]] || fail 'Invalid TIME_LIMIT'
+    if [[ ! $JUPYTER_PORT =~ ^[1-9][0-9]{0,4}$ ]] || ((JUPYTER_PORT > 65535)); then
+        fail 'JUPYTER_PORT must be 1–65535'
+    fi
+    [[ $LOG_DIR = /* && $LOG_DIR != *%* ]] || fail 'LOG_DIR must be absolute and contain no %'
+    declaration=$(declare -p SCRATCH_ROOTS)
+    [[ $declaration = 'declare -a '* && ${#SCRATCH_ROOTS[@]} -gt 0 ]] || fail 'SCRATCH_ROOTS must be a nonempty Bash array'
+    for root in "${SCRATCH_ROOTS[@]}"; do
+        [[ $root = /* && $root != *$'\n'* ]] || fail 'Scratch roots must be absolute single-line paths'
+    done
+    KEYTAB=${KEYTAB:-}
+    ENV_SETUP=${ENV_SETUP:-}
+    [[ -z $KEYTAB || $KEYTAB = /* ]] || fail 'KEYTAB must be absolute'
+    [[ -z $ENV_SETUP || ( $ENV_SETUP = /* && -r $ENV_SETUP ) ]] || fail 'ENV_SETUP must be an absolute readable file'
+    mkdir -p -- "$LOG_DIR"
+    [[ -w $LOG_DIR ]] || fail 'LOG_DIR is not writable'
+}
+
+case $command_name in
+    schedule)
+        exec 9> "$state_dir/lock"
+        flock -x 9
+        if [[ -f $state_dir/current ]]; then
+            load_current; query
+            finished || fail "Allocation $JOB_ID is still $JOB_STATE"
+        fi
+        # Clear previous settings and inherited configuration values.
+        unset JOB_NAME PARTITION GRES CPUS_PER_TASK MEMORY TIME_LIMIT LOG_DIR SCRATCH_ROOTS KEYTAB ENV_SETUP JUPYTER_PORT
+        [[ -r $config ]] || fail "Missing configuration: $config; copy config.example.sh there and edit it"
+        # shellcheck disable=SC1090
+        source "$config"
+        validate_config
+        LAUNCH_DIR=$(mktemp -d "$state_dir/launch.XXXXXXXX")
+        LAUNCH_USER=$(id -un)
+        {
+            for name in JOB_NAME PARTITION GRES CPUS_PER_TASK MEMORY TIME_LIMIT LOG_DIR KEYTAB ENV_SETUP JUPYTER_PORT LAUNCH_USER; do
+                printf '%s=%q\n' "$name" "${!name}"
+            done
+            printf 'SCRATCH_ROOTS=('
+            printf ' %q' "${SCRATCH_ROOTS[@]}"
+            printf ' )\n'
+        } > "$LAUNCH_DIR/settings.sh"
+        {
+            printf '#!/usr/bin/env bash\nset -euo pipefail\numask 077\nLAUNCH_DIR=%q\n' "$LAUNCH_DIR"
+            # Expand on the compute node, not while generating the script.
+            # shellcheck disable=SC2016
+            printf 'source "$LAUNCH_DIR/settings.sh"\n'
+            declare -f batch_main
+            printf 'batch_main\n'
+        } > "$LAUNCH_DIR/batch.sh"
+        # JOB_NAME is supplied by the validated configuration.
+        # shellcheck disable=SC2153
+        args=(--parsable --nodes=1 --ntasks=1 "--job-name=$JOB_NAME"
+            "--cpus-per-task=$CPUS_PER_TASK" "--mem=$MEMORY" "--time=$TIME_LIMIT"
+            "--output=$LOG_DIR/slurm-utils-%j.out" "--error=$LOG_DIR/slurm-utils-%j.err"
+            "--chdir=$HOME" --export=ALL)
+        [[ -z $PARTITION ]] || args+=("--partition=$PARTITION")
+        [[ -z $GRES ]] || args+=("--gres=$GRES")
+        result=$(sbatch "${args[@]}" "$LAUNCH_DIR/batch.sh") || fail 'Submission failed; previous state preserved'
+        [[ $result =~ ^([0-9]+)(\;[a-zA-Z0-9_.-]+)?$ ]] ||
+            fail "Unexpected sbatch output: $result; inspect squeue before retrying (job may have been submitted)"
+        JOB_ID=${BASH_REMATCH[1]}
+        temp=$(mktemp "$state_dir/.current.XXXXXX")
+        printf 'JOB_ID=%q\nLAUNCH_DIR=%q\n' "$JOB_ID" "$LAUNCH_DIR" > "$temp"
+        mv -- "$temp" "$state_dir/current"
+        printf 'Scheduled allocation %s\n' "$JOB_ID"
+        ;;
+    cancel)
+        exec 9> "$state_dir/lock"
+        flock -x 9
+        load_current
+        scancel "$JOB_ID" || fail 'Cancellation failed; saved state preserved'
+        rm -- "$state_dir/current"
+        printf 'Cancelled allocation %s; scratch data retained\n' "$JOB_ID"
+        ;;
+    status|connect|jupyter)
+        load_current; query
+        scratch=''
+        [[ ! -f $LAUNCH_DIR/scratch-$JOB_ID ]] || IFS= read -r scratch < "$LAUNCH_DIR/scratch-$JOB_ID"
+        if [[ $command_name = status ]]; then
+            printf 'Job: %s\nState: %s\nNode: %s\nScratch: %s\nStdout: %s/slurm-utils-%s.out\nStderr: %s/slurm-utils-%s.err\n' \
+                "$JOB_ID" "$JOB_STATE" "${JOB_NODE:--}" "${scratch:-initializing; retry shortly}" "$LOG_DIR" "$JOB_ID" "$LOG_DIR" "$JOB_ID"
+            exit 0
+        fi
+        [[ $JOB_STATE = RUNNING ]] || fail "Allocation $JOB_ID is $JOB_STATE; a running allocation is required"
+        [[ -n $scratch ]] || fail 'Allocation initializing; retry shortly'
+        step=(srun --jobid "$JOB_ID" --overlap --nodes=1 --ntasks=1 --export=ALL)
+        if [[ $command_name = connect ]]; then
+            # Positional parameters are expanded by the remote Bash.
+            # shellcheck disable=SC2016
+            exec "${step[@]}" --pty bash -c 'export SCRATCH_DIR=$1; exec bash --login' bash "$scratch"
+        fi
+        # Positional parameters and token generation belong to the remote Bash.
+        # shellcheck disable=SC2016
+        exec "${step[@]}" bash -c '
+            set -euo pipefail
+            export SCRATCH_DIR=$1
+            if [[ -n $2 ]]; then source "$2"; fi
+            token=$(od -An -N32 -tx1 /dev/urandom | tr -d " \n")
+            [[ ${#token} = 64 ]] || { echo "Token generation failed" >&2; exit 1; }
+            export JUPYTER_TOKEN=$token
+            printf "Jupyter URL (once ready): http://%s:%s/?token=%s\n" "$(hostname -f)" "$3" "$token"
+            exec jupyter notebook --no-browser --ip=0.0.0.0 --port="$3" --port-retries=0
+        ' bash "$scratch" "$ENV_SETUP" "$JUPYTER_PORT"
+        ;;
+esac
