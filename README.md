@@ -8,8 +8,11 @@ Jupyter. It tracks one current allocation per state directory.
 Use Linux x86-64 with Bash 4+, standard Linux utilities (including `flock` from
 util-linux), and working `sbatch`, `squeue`, `srun`, and `scancel` commands.
 No compilation, root access, package manager, or Python runtime is needed by
-this utility. Jupyter Notebook must already be available on the compute node
-for the `jupyter` command; optional Kerberos renewal uses `k5start` and a keytab.
+this utility. Jupyter Notebook must be available on the compute node for the
+`jupyter` command; `set-up` can optionally install it in your project environment.
+Optional Kerberos renewal uses `k5start` and a keytab.
+The optional `set-up` command needs Python 3 with `venv` support, zsh, curl,
+and network access from the compute node to download direnv.
 
 Your home directory and state directory **must be shared between login and
 compute nodes**, at the same absolute paths. Use one Slurm cluster per state
@@ -54,9 +57,12 @@ specific resource names and time limits. `MEMORY` accepts an integer with an
 optional K/M/G/T suffix; `TIME_LIMIT` accepts Slurm numeric time forms such as
 `08:00:00` or `2-00:00:00`.
 
-Also set `LOG_DIR` (absolute, no `%` characters), `SCRATCH_ROOTS` (a nonempty
-Bash array of absolute paths), and `JUPYTER_PORT` (1–65535). Paths containing
-spaces are supported when quoted in the configuration.
+Also set `LOG_DIR` (absolute, no `%` characters) and `SCRATCH_ROOTS` (a nonempty
+Bash array of absolute paths). `JUPYTER_PORT` is optional and defaults to 1234;
+an explicit value must be 1–65535. Existing configurations and allocation
+snapshots keep their saved port; change your configuration and schedule a new
+allocation to use a different port. Paths containing spaces are supported
+when quoted in the configuration.
 
 `KEYTAB` and `ENV_SETUP` are optional and may be empty. If `k5start` is on the
 compute node's PATH and the keytab exists, the reservation starts ticket
@@ -71,9 +77,11 @@ ENV_SETUP="$HOME/jupyter-environment.sh"
 source "$HOME/venvs/notebooks/bin/activate"
 ```
 
-The utility sources that file before launching Jupyter. Otherwise it uses the
-available environment. It does not install or manage environments. Connected
-shells use normal Bash login startup files; `ENV_SETUP` applies only to Jupyter.
+The utility sources that file before launching Jupyter. Otherwise it uses
+`.venv/bin/jupyter` in the current project directory when present, or the
+available `jupyter` command. The `jupyter` command does not install environments.
+Connected shells use normal login startup files; `ENV_SETUP` applies only to Jupyter.
+To create a project environment interactively, use `set-up` below.
 
 ## Workflow
 
@@ -89,6 +97,8 @@ printf '%s\n' "$SCRATCH_DIR"
 exit
 # Back on the login node:
 slurm-utils jupyter
+# Or override the port for this launch only:
+slurm-utils jupyter 1235
 # Ctrl-C stops the Jupyter step; the reservation remains available.
 slurm-utils cancel
 ```
@@ -106,9 +116,16 @@ it does not assert successful completion. Consult logs or your cluster's
 node placeholder. Before scratch metadata arrives, attachment reports
 “initializing; retry shortly.” Check the batch logs if initialization fails.
 
-`connect` opens `bash --login` in an interactive `srun` step. `jupyter` opens a
+`connect` opens `zsh --login` in an interactive `srun` step, falling back to
+`bash --login` with a message if zsh is unavailable. It starts in the same
+directory from which you ran `connect`; that path must exist on the compute
+node. An unavailable directory fails rather than silently starting elsewhere.
+`jupyter` opens a
 foreground step and runs `jupyter notebook --no-browser --ip=0.0.0.0` with the
-configured port and zero port retries. Both export `SCRATCH_DIR` and use
+configured port (or the optional `jupyter PORT` argument) and zero port retries.
+Port arguments must be integers from 1 to 65535 and do not change saved settings.
+Jupyter starts in the directory from which you ran the command.
+Both export `SCRATCH_DIR` and use
 [`srun --overlap`](https://slurm.schedmd.com/srun.html) to share the reservation's
 resources. Exiting a shell or stopping Jupyter leaves the allocation running.
 
@@ -126,6 +143,70 @@ a different port. Normal Jupyter output and errors remain in your terminal.
 `cancel` calls `scancel` and clears the current pointer only after Slurm accepts
 cancellation. Failure preserves the pointer so you can retry. Cancellation
 ends the allocation and its steps; it may take Slurm a short time to finish.
+
+## Interactive project setup
+
+From your project directory on the login node, with a running, initialized
+allocation:
+
+```bash
+slurm-utils set-up
+slurm-utils connect
+```
+
+`set-up` connects to that allocation in the current directory, prints each
+command, and requires an explicit `y` or `yes` before running it. Empty input,
+EOF, and other answers decline. It asks before connecting, creating `.venv`,
+installing direnv, changing your login shell, appending each configuration
+line, and trusting `.envrc`. Declining a required step stops setup; declining
+`chsh` offers the same fallback as a failed shell change. Earlier completed
+steps are retained, so you can rerun setup.
+
+Setup creates `.venv` with `python3 -m venv .venv`, or reuses a working existing
+environment. It stops on an incomplete `.venv` without deleting it. If Python,
+its venv support, or zsh is unavailable, load the appropriate cluster module
+or ask your administrator, then retry.
+
+At the end, setup asks whether to install Jupyter Notebook and ipykernel with
+`.venv/bin/python -m pip install notebook ipykernel`. These provide the notebook
+server and Python kernel for the [VS Code Jupyter extension](https://code.visualstudio.com/docs/datascience/jupyter-notebooks).
+Declining skips installation and registration and still completes setup. If
+pip is missing from an existing environment, setup asks before bootstrapping
+it with `.venv/bin/python -m ensurepip --upgrade`. Installation errors stop
+setup with a message; rerun it after fixing the environment or package-index
+access.
+
+After installation, a separate confirmation asks to register the environment
+using its absolute Python path and `-m ipykernel install --user`. The
+[registered kernel](https://ipython.readthedocs.io/en/stable/install/kernel_install.html)
+appears as `Python (.venv: /path/to/project)` in Jupyter and VS Code. Its internal
+name is derived from the project's absolute path, so reruns update the same
+kernel and different projects have different names. Declining registration
+leaves installed packages in place. Run `slurm-utils jupyter` from the project
+directory to launch its server, then select this kernel in VS Code.
+
+It downloads the [official direnv installer](https://direnv.net/docs/installation.html)
+and runs it with `bin_path` set to the directory containing the resolved
+`slurm-utils` executable. That directory must be writable and shared. A
+working direnv already in that directory is reused. Failed or empty downloads
+stop setup before the installer runs; installation failures are reported and
+can be retried. There is no sudo or system package installation.
+
+Setup tries `chsh -s /path/to/zsh`. When unavailable, declined, or rejected by
+cluster policy, it offers to append `export SHELL=/path/to/zsh` to `.envrc`.
+This sets the project's preferred shell; `connect` launches zsh directly even
+when the account's login shell could not be changed. Direnv evaluates `.envrc`
+in a subprocess, so this fallback does not replace an already running shell.
+
+Setup appends activation of `.venv` and adds the binary directory to `PATH`
+in `.envrc`. It adds the [direnv shell hooks](https://direnv.net/docs/hook.html)
+to `${ZDOTDIR:-$HOME}/.zshrc` and `~/.bashrc`, using the installed binary's
+absolute path. Existing file contents are preserved and matching lines are
+not appended twice. The entire `.envrc` is displayed before asking to run
+`direnv allow .`, because allowing it trusts any existing commands too.
+Setup then returns to the login node; the next `connect` starts a fresh shell
+and loads the project environment. For Bash login sessions outside `connect`,
+ensure your login startup file sources `~/.bashrc` to activate its hook.
 
 ## State, logs, and scratch lifetime
 
@@ -178,8 +259,12 @@ Tests use temporary directories and fake Slurm/Jupyter commands. They cover
 missing/invalid configuration, quoted paths, duplicate submission, pending,
 running and finished jobs, scheduler failures, scratch selection/failure,
 cancellation failure, settings persistence, environment setup, step options,
-and Jupyter arguments and fresh tokens. No cluster or Jupyter installation is
-needed. ShellCheck is a development-only dependency.
+Jupyter arguments and fresh tokens, connection directories and shell fallback,
+and setup confirmations, reruns, preservation of existing files, and failure
+paths for venv, direnv, and login-shell changes. No cluster or Jupyter installation is
+needed. Tests also cover optional package installation and registration,
+missing pip, package/kernel failures, project environment selection, and port
+overrides and validation. ShellCheck is a development-only dependency.
 
 Before relying on a real cluster:
 
@@ -195,6 +280,11 @@ Before relying on a real cluster:
 5. Run `cancel` from another login terminal. Confirm the reservation and all
    steps disappear from Slurm, the current pointer is cleared, and scratch
    was not deleted by the utility.
+6. In a disposable shared project directory with a new allocation, run
+   `set-up`. Review each displayed command. Check the resulting `.venv`,
+   `.envrc`, shell hooks, and direnv next to `slurm-utils`. Connect and verify
+   `pwd`, `echo "$SHELL"`, and `python -c 'import sys; print(sys.prefix)'`.
+   If `chsh` is denied, verify the project-local fallback still selects zsh.
 
 Mocks cannot establish cluster compatibility, network reachability, Kerberos
 behavior, GPU visibility, or site-specific Slurm policy.

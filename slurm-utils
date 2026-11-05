@@ -5,12 +5,23 @@ umask 077
 fail() { printf 'slurm-utils: %s\n' "$*" >&2; exit 1; }
 help() {
     cat <<'HELP'
-Usage: slurm-utils [--config PATH] schedule|status|connect|jupyter|cancel
+Usage: slurm-utils [--config PATH] schedule|status|connect|set-up|jupyter|cancel
+       slurm-utils [--config PATH] jupyter [PORT]
 
 Track one Slurm allocation. Configuration defaults to
 ~/.config/slurm-utils/config.sh (trusted Bash code).
 Existing allocations use saved settings, without loading configuration again.
+connect preserves your current directory and prefers zsh (falls back to Bash).
+set-up prepares .venv, direnv, and zsh in this directory inside a running job,
+asking for confirmation before each change. Jupyter defaults to port 1234.
+set-up can optionally install Notebook/ipykernel and register the .venv kernel.
 HELP
+}
+
+validate_port() {
+    if [[ ! $1 =~ ^[1-9][0-9]{0,4}$ ]] || (($1 > 65535)); then
+        fail 'Jupyter port must be an integer from 1 to 65535'
+    fi
 }
 
 # These functions are copied into the submitted script; no installed executable
@@ -51,16 +62,147 @@ batch_main() {
     while :; do sleep 3600 & sleeper=$!; wait "$sleeper"; done
 }
 
+# Used locally and copied into the setup step so prompts remain interactive.
+confirm() {
+    local answer
+    printf '\nAbout to run:\n%s\nRun this command? [y/N] ' "$1" >&2
+    IFS= read -r answer || return 1
+    case $answer in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+confirm_command() {
+    local displayed
+    printf -v displayed '%q ' "$@"
+    confirm "$displayed"
+}
+
+# Preserve existing user configuration; repeated setup does not duplicate lines.
+append_confirmed() {
+    local file=$1 line=$2 displayed
+    if [[ -f $file ]] && grep -Fqx -- "$line" "$file"; then return; fi
+    [[ ! -e $file || -f $file ]] || fail "Not a regular file: $file"
+    printf -v displayed "printf '\\n%%s\\n' %q >> %q" "$line" "$file"
+    confirm "$displayed" || fail 'Setup stopped: command declined'
+    printf '\n%s\n' "$line" >> "$file" || fail "Cannot update $file"
+}
+
+setup_main() {
+    set -euo pipefail
+    umask 077
+    export SCRATCH_DIR=$1
+    local project=$2 bin_dir=$3 zsh_path direnv installer install_command hook
+    local venv_python kernel_name
+    local shell_fallback=0
+    cd -- "$project" || fail "Project directory is unavailable on this node: $project"
+    [[ -d $bin_dir && -w $bin_dir ]] || fail "Binary directory must be shared and writable: $bin_dir"
+    zsh_path=$(command -v zsh) || fail 'zsh is unavailable; load a cluster module providing zsh, then retry set-up'
+    [[ $zsh_path = /* && -x $zsh_path ]] || fail 'zsh must resolve to an absolute executable path'
+    [[ -d ${ZDOTDIR:-$HOME} ]] || fail 'ZDOTDIR must exist before set-up'
+    direnv="$bin_dir/direnv"
+
+    if [[ -e .venv || -L .venv ]]; then
+        [[ -f .venv/pyvenv.cfg && -r .venv/bin/activate && -x .venv/bin/python ]] ||
+            fail 'Existing .venv is incomplete; repair it or move it aside before retrying (nothing removed)'
+        .venv/bin/python -c 'import sys; assert sys.prefix != sys.base_prefix' ||
+            fail 'Existing .venv is not usable on this node; repair it or move it aside'
+        printf 'Reusing existing .venv\n'
+    else
+        command -v python3 >/dev/null || fail 'python3 is unavailable; load a cluster Python module and retry'
+        confirm_command python3 -m venv .venv || fail 'Setup stopped: command declined'
+        python3 -m venv .venv ||
+            fail 'venv creation failed; check Python venv/ensurepip support. Any partial .venv was retained'
+    fi
+
+    if [[ ! -x $direnv ]] || ! "$direnv" version >/dev/null 2>&1; then
+        command -v curl >/dev/null || fail 'curl is required to install direnv'
+        # Show the exact download and installation commands, including bin_path.
+        # shellcheck disable=SC2016
+        printf -v install_command 'installer=$(curl -sfL https://direnv.net/install.sh) && bin_path=%q bash <<< "$installer"' "$bin_dir"
+        confirm "$install_command" || fail 'Setup stopped: command declined'
+        installer=$(curl -sfL https://direnv.net/install.sh) || fail 'direnv download failed; retry when network access is available'
+        [[ -n $installer ]] || fail 'direnv installer download was empty'
+        bin_path="$bin_dir" bash <<< "$installer" || fail 'direnv installation failed; retry set-up after fixing the reported error'
+        if [[ ! -x $direnv ]] || ! "$direnv" version >/dev/null 2>&1; then
+            fail "direnv installer did not produce a working $direnv"
+        fi
+    fi
+
+    if command -v chsh >/dev/null; then
+        if confirm_command chsh -s "$zsh_path"; then
+            if ! chsh -s "$zsh_path"; then
+                printf 'chsh failed; offering a project-local SHELL fallback.\n' >&2
+                shell_fallback=1
+            fi
+        else
+            printf 'chsh declined; offering a project-local SHELL fallback.\n' >&2
+            shell_fallback=1
+        fi
+    else
+        printf 'chsh is unavailable; offering a project-local SHELL fallback.\n' >&2
+        shell_fallback=1
+    fi
+
+    append_confirmed .envrc 'source .venv/bin/activate'
+    printf -v hook 'PATH_add %q' "$bin_dir"
+    append_confirmed .envrc "$hook"
+    if ((shell_fallback)); then
+        printf -v hook 'export SHELL=%q' "$zsh_path"
+        append_confirmed .envrc "$hook"
+    fi
+    # Hook both shells, including accounts where changing the login shell fails.
+    # Expanded by the user's shell when loading its startup file.
+    # shellcheck disable=SC2016
+    printf -v hook 'eval "$(%q hook zsh)"' "$direnv"
+    append_confirmed "${ZDOTDIR:-$HOME}/.zshrc" "$hook"
+    # shellcheck disable=SC2016
+    printf -v hook 'eval "$(%q hook bash)"' "$direnv"
+    append_confirmed "$HOME/.bashrc" "$hook"
+
+    printf '\nReview %s/.envrc before allowing it:\n' "$project"
+    cat -- .envrc
+    confirm_command "$direnv" allow . || fail 'Setup stopped: .envrc not allowed; review it and run direnv allow manually'
+    "$direnv" allow . || fail 'direnv allow failed; review .envrc and retry manually'
+
+    venv_python="$project/.venv/bin/python"
+    printf '\nOptional: install Jupyter Notebook and ipykernel in .venv for VS Code?\n'
+    if confirm_command "$venv_python" -m pip install notebook ipykernel; then
+        if ! "$venv_python" -m pip --version >/dev/null 2>&1; then
+            confirm_command "$venv_python" -m ensurepip --upgrade || fail 'Jupyter installation stopped: pip bootstrap declined'
+            "$venv_python" -m ensurepip --upgrade || fail 'pip bootstrap failed; use a Python installation with ensurepip support and retry'
+        fi
+        "$venv_python" -m pip install notebook ipykernel || fail 'Jupyter installation failed; check package-index access and retry set-up'
+        # Stable per-project name avoids replacing another project's .venv kernel.
+        kernel_name=$(printf '%s' "$project" | sha256sum)
+        kernel_name="slurm-utils-${kernel_name:0:16}"
+        confirm_command "$venv_python" -m ipykernel install --user --name "$kernel_name" \
+            --display-name "Python (.venv: $project)" || fail 'Jupyter installed; kernel registration declined'
+        "$venv_python" -m ipykernel install --user --name "$kernel_name" \
+            --display-name "Python (.venv: $project)" || fail 'Jupyter installed; kernel registration failed; retry set-up'
+    else
+        printf 'Skipping optional Jupyter installation and kernel registration.\n'
+    fi
+    printf 'Setup complete in %s. Run slurm-utils connect from this directory.\n' "$project"
+}
+
 config="$HOME/.config/slurm-utils/config.sh"
+caller_dir=$(pwd -P)
 command_name=''
+port_override=''
 while (($#)); do
     case $1 in
         --help|-h) help; exit 0 ;;
         --config) (($# >= 2)) || fail '--config needs a path'; config=$2; shift 2 ;;
-        schedule|status|connect|jupyter|cancel)
+        schedule|status|connect|set-up|jupyter|cancel)
             [[ -z $command_name ]] || fail 'Specify one command'
             command_name=$1; shift ;;
-        *) fail "Unknown argument: $1 (see --help)" ;;
+        *)
+            if [[ $command_name = jupyter && -z $port_override ]]; then
+                validate_port "$1"
+                port_override=$1; shift
+            else
+                fail "Unknown argument: $1 (see --help)"
+            fi
+            ;;
     esac
 done
 [[ -n $command_name ]] || { help; exit 1; }
@@ -96,18 +238,17 @@ finished() {
 }
 validate_config() {
     local name root declaration
-    for name in JOB_NAME PARTITION GRES CPUS_PER_TASK MEMORY TIME_LIMIT LOG_DIR SCRATCH_ROOTS JUPYTER_PORT; do
+    for name in JOB_NAME PARTITION GRES CPUS_PER_TASK MEMORY TIME_LIMIT LOG_DIR SCRATCH_ROOTS; do
         [[ ${!name+x} ]] || fail "Configuration must define $name (PARTITION and GRES may be empty)"
     done
+    JUPYTER_PORT=${JUPYTER_PORT-1234}
     for name in JOB_NAME MEMORY TIME_LIMIT LOG_DIR; do
         [[ -n ${!name} && ${!name} != *$'\n'* ]] || fail "Invalid $name"
     done
     [[ $CPUS_PER_TASK =~ ^[1-9][0-9]*$ ]] || fail 'CPUS_PER_TASK must be a positive integer'
     [[ $MEMORY =~ ^[0-9]+([KkMmGgTt])?$ ]] || fail 'MEMORY must be a Slurm size, e.g. 16G'
     [[ $TIME_LIMIT =~ ^[0-9]+(-[0-9]+)?(:[0-9]+){0,2}$ ]] || fail 'Invalid TIME_LIMIT'
-    if [[ ! $JUPYTER_PORT =~ ^[1-9][0-9]{0,4}$ ]] || ((JUPYTER_PORT > 65535)); then
-        fail 'JUPYTER_PORT must be 1–65535'
-    fi
+    validate_port "$JUPYTER_PORT"
     [[ $LOG_DIR = /* && $LOG_DIR != *%* ]] || fail 'LOG_DIR must be absolute and contain no %'
     declaration=$(declare -p SCRATCH_ROOTS)
     [[ $declaration = 'declare -a '* && ${#SCRATCH_ROOTS[@]} -gt 0 ]] || fail 'SCRATCH_ROOTS must be a nonempty Bash array'
@@ -179,7 +320,7 @@ case $command_name in
         rm -- "$state_dir/current"
         printf 'Cancelled allocation %s; scratch data retained\n' "$JOB_ID"
         ;;
-    status|connect|jupyter)
+    status|connect|set-up|jupyter)
         load_current; query
         scratch=''
         [[ ! -f $LAUNCH_DIR/scratch-$JOB_ID ]] || IFS= read -r scratch < "$LAUNCH_DIR/scratch-$JOB_ID"
@@ -191,22 +332,52 @@ case $command_name in
         [[ $JOB_STATE = RUNNING ]] || fail "Allocation $JOB_ID is $JOB_STATE; a running allocation is required"
         [[ -n $scratch ]] || fail 'Allocation initializing; retry shortly'
         step=(srun --jobid "$JOB_ID" --overlap --nodes=1 --ntasks=1 --export=ALL)
+        if [[ $command_name = set-up ]]; then
+            binary=$(readlink -f -- "${BASH_SOURCE[0]}")
+            bin_dir=$(dirname -- "$binary")
+            # Keep the step script in private shared state, like the batch script.
+            # A file also lets the prompt show the complete, runnable srun command.
+            setup_script=$(mktemp "$LAUNCH_DIR/setup.XXXXXX")
+            {
+                declare -f fail confirm confirm_command append_confirmed setup_main
+                printf 'setup_main "$@"\n'
+            } > "$setup_script"
+            confirm_command "${step[@]}" --chdir="$caller_dir" --pty bash "$setup_script" \
+                "$scratch" "$caller_dir" "$bin_dir" || fail 'Setup connection declined'
+            exec "${step[@]}" --chdir="$caller_dir" --pty bash "$setup_script" "$scratch" "$caller_dir" "$bin_dir"
+        fi
         if [[ $command_name = connect ]]; then
             # Positional parameters are expanded by the remote Bash.
             # shellcheck disable=SC2016
-            exec "${step[@]}" --pty bash -c 'export SCRATCH_DIR=$1; exec bash --login' bash "$scratch"
+            exec "${step[@]}" --chdir="$caller_dir" --pty bash -c '
+                export SCRATCH_DIR=$1
+                cd -- "$2" || { echo "Project directory unavailable: $2" >&2; exit 1; }
+                if command -v zsh >/dev/null; then
+                    export SHELL=$(command -v zsh)
+                    exec "$SHELL" --login
+                fi
+                echo "zsh unavailable; falling back to Bash" >&2
+                exec bash --login
+            ' bash "$scratch" "$caller_dir"
         fi
         # Positional parameters and token generation belong to the remote Bash.
         # shellcheck disable=SC2016
-        exec "${step[@]}" bash -c '
+        exec "${step[@]}" --chdir="$caller_dir" bash -c '
             set -euo pipefail
             export SCRATCH_DIR=$1
-            if [[ -n $2 ]]; then source "$2"; fi
+            jupyter_command=jupyter
+            if [[ -n $2 ]]; then
+                source "$2"
+            elif [[ -x $4/.venv/bin/jupyter ]]; then
+                export VIRTUAL_ENV="$4/.venv"
+                export PATH="$VIRTUAL_ENV/bin:$PATH"
+                jupyter_command="$VIRTUAL_ENV/bin/jupyter"
+            fi
             token=$(od -An -N32 -tx1 /dev/urandom | tr -d " \n")
             [[ ${#token} = 64 ]] || { echo "Token generation failed" >&2; exit 1; }
             export JUPYTER_TOKEN=$token
             printf "Jupyter URL (once ready): http://%s:%s/?token=%s\n" "$(hostname -f)" "$3" "$token"
-            exec jupyter notebook --no-browser --ip=0.0.0.0 --port="$3" --port-retries=0
-        ' bash "$scratch" "$ENV_SETUP" "$JUPYTER_PORT"
+            exec "$jupyter_command" notebook --no-browser --ip=0.0.0.0 --port="$3" --port-retries=0
+        ' bash "$scratch" "$ENV_SETUP" "${port_override:-$JUPYTER_PORT}" "$caller_dir"
         ;;
 esac

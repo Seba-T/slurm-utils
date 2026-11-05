@@ -19,4 +19,4 @@ SCRATCH_ROOTS=(
 
 KEYTAB="$HOME/my.keytab"
 ENV_SETUP=""                 # Optional absolute path to a shell setup file
-JUPYTER_PORT=8888
+JUPYTER_PORT=1234
