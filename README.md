@@ -109,6 +109,62 @@ sleeps until cancellation or the time limit. Scheduling again while the current
 job is active fails with its ID and state. A successful queue query confirming
 that the job has finished permits replacement. Query failures preserve state.
 
+### Choose a GPU by video memory
+
+```bash
+slurm-utils schedule --vmem 30
+# Also accepts 30G or 30GB; all mean at least 30 GB per GPU.
+```
+
+`--vmem` is optional and only valid with `schedule`. It queries `sinfo` for the
+GPU types advertised in the configured `PARTITION` (or Slurm's default view
+when `PARTITION` is empty), removes duplicates, and filters by nominal VRAM.
+It overrides the GPU type in `GRES`, preserving the count. `GRES` must be empty
+(defaulting to one GPU) or one `gpu[:type]:count` request. Without `--vmem`,
+scheduling continues to use `GRES` as configured.
+
+Slurm does not expose a portable GPU VRAM inventory field. Capacity is resolved
+from explicit type suffixes such as `a100_80gb` and MIG `h200_3g.71gb`, then an
+exact model table: A40/L40/L40S/RTX A6000/RTX 6000 Ada (48 GB), H200 (141 GB),
+and RTX PRO 6000 Blackwell server/workstation editions (96 GB). These are
+nominal model/profile capacities, not measurements of currently free CUDA
+memory. Unknown types are skipped with a message, rather than guessed from
+the parent GPU name. Add or override site-specific names in trusted config:
+
+```bash
+declare -A GPU_MEMORY_GB=(
+  [site_specific_gpu]=48
+  [site_mig_profile]=40
+)
+```
+
+The command lists all qualifying types and capacities, runs
+[`sbatch --test-only`](https://slurm.schedmd.com/sbatch.html#OPT_test-only)
+for each using the same CPU, RAM, partition, and time requirements as the final
+request, and prints each estimated start time in UTC. Estimates that fail or
+contain no start time are reported and skipped. It prints the chosen type and
+expected start, then submits **one** job for the earliest estimate; ties use
+alphabetical GPU type order. For example:
+
+```text
+Considering GPUs with at least 30 GB VRAM per GPU (count 1):
+  gpu:a40:1 (48 GB per GPU)
+  gpu:h200_3g.71gb:1 (71 GB per GPU)
+  gpu:a40:1: estimated start 2026-11-07T18:34:45 UTC
+  gpu:h200_3g.71gb:1: estimated start 2026-11-07T14:08:46 UTC
+Chosen GPU: gpu:h200_3g.71gb:1 (71 GB per GPU); expected start 2026-11-07T14:08:46 UTC.
+Start time is an estimate; the submitted GPU type remains fixed while queued.
+Scheduled allocation 123
+```
+
+No qualifying types, a failed inventory query, or no usable scheduling estimates
+causes a failure without submitting a job or replacing the current allocation
+pointer. A pending job retains its chosen type; it does not switch types as
+queue conditions change. Slurm's estimates can change between checking and
+submission, and cluster policy still determines access and actual start times.
+The chosen typed `GRES` is saved for inspection in the allocation settings.
+`--mem` and `--mem-per-gpu` concern host RAM and do not set this VRAM minimum.
+
 `status` reports the ID, queue state, assigned node, scratch path when known,
 and stdout/stderr paths. `FINISHED` means the job is no longer in the queue;
 it does not assert successful completion. Consult logs or your cluster's
@@ -264,9 +320,10 @@ and must be handled separately.
 ## Validation
 
 ```bash
-bash -n slurm-utils install.sh config.example.sh tests/test.sh tests/tmux.sh
-shellcheck slurm-utils install.sh config.example.sh tests/test.sh tests/tmux.sh
+bash -n slurm-utils install.sh config.example.sh tests/test.sh tests/tmux.sh tests/vmem.sh
+shellcheck slurm-utils install.sh config.example.sh tests/test.sh tests/tmux.sh tests/vmem.sh
 bash tests/test.sh
+bash tests/vmem.sh
 # With tmux installed (uses an isolated temporary tmux server):
 bash tests/tmux.sh
 ```
@@ -281,6 +338,9 @@ paths for venv, direnv, and login-shell changes. No cluster or Jupyter installat
 needed. Tests also cover optional package installation and registration,
 missing pip, package/kernel failures, project environment selection, and port
 overrides and validation. ShellCheck is a development-only dependency.
+VRAM tests cover discovery, MIG sizes, unknown types and overrides, printed
+estimates, earliest selection and ties, GPU counts, saved selection, CLI
+validation, scheduler failures, and the single-submission guarantee.
 The tmux integration test checks new windows and split panes, reattachment,
 session recreation, quoted paths, and preservation of unrelated sessions.
 
