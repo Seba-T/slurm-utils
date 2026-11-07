@@ -35,6 +35,7 @@ fi
 MOCK
 cat > "$work/bin/squeue" <<'MOCK'
 #!/usr/bin/env bash
+[[ ! -e $VMEM_TEST_WORK/finished ]] || exit 0
 printf '123|RUNNING|node1\n'
 MOCK
 chmod +x "$work/bin/"*
@@ -83,7 +84,7 @@ run schedule --vmem 30
 grep -Fxq -- '--partition=ICF-Free' "$work/sinfo.args"
 grep -Fxq -- '--gres=gpu:h200_3g.71gb:1' "$work/submit.args"
 [[ $(grep -c -- '--gres=gpu:a40:1' "$work/estimates") = 1 ]]
-! grep -q 'h200_1g.18gb' "$work/estimates"
+if grep -q 'h200_1g.18gb' "$work/estimates"; then exit 1; fi
 grep -q 'Skipping GPU mystery: unknown VRAM' "$work/output"
 grep -q 'Considering GPUs with at least 30 GB' "$work/output"
 grep -q 'gpu:a40:1 (48 GB per GPU)' "$work/output"
@@ -100,11 +101,36 @@ if run schedule --vmem 30; then exit 1; fi
 grep -q 'still RUNNING' "$work/output"
 [[ ! -s $work/submissions ]]
 
+# Failed discovery/estimates must not replace an existing finished allocation.
+cp "$XDG_STATE_HOME/slurm-utils/current" "$work/saved-current"
+touch "$work/finished"
+for failure in inventory-fail estimate-fail submit-fail; do
+    : > "$work/submissions"
+    touch "$work/$failure"
+    if run schedule --vmem 30; then exit 1; fi
+    cmp "$work/saved-current" "$XDG_STATE_HOME/slurm-utils/current"
+    if [[ $failure = submit-fail ]]; then
+        [[ $(wc -l < "$work/submissions") = 1 ]]
+    else
+        [[ ! -s $work/submissions ]]
+    fi
+    rm "$work/$failure"
+done
+rm "$work/finished"
+
 # Minimum is inclusive, preserved GPU count is per GPU, and ties are stable.
 printf '2026-11-07T14:00:00\n' > "$work/h200_3g.71gb.start"
 printf 'GRES=gpu:nvidia_h200:2\n' >> "$config"
 fresh
 run schedule --vmem 48G
+grep -Fxq -- '--gres=gpu:a40:2' "$work/submit.args"
+
+# Compare GPU type names themselves: a shorter prefix sorts before its variant,
+# even though the ':' after it sorts after '-' in the full inventory record.
+printf 'gpu:a40-48gb:4(S:0)\n' >> "$work/inventory"
+printf '2026-11-07T14:00:00\n' > "$work/a40-48gb.start"
+fresh
+run schedule --vmem 48
 grep -Fxq -- '--gres=gpu:a40:2' "$work/submit.args"
 
 # A site capacity override supports otherwise unknown names; suffixes support
@@ -114,7 +140,7 @@ printf '2026-11-07T12:00:00\n' > "$work/mystery.start"
 fresh
 run schedule --vmem 64GB
 grep -Fxq -- '--gres=gpu:mystery:2' "$work/submit.args"
-! grep -q 'gpu:a40:' "$work/estimates"
+if grep -q 'gpu:a40:' "$work/estimates"; then exit 1; fi
 printf 'gpu:new_model_80gb:1(S:0)\n' >> "$work/inventory"
 printf '2026-11-07T11:00:00\n' > "$work/new_model_80gb.start"
 fresh
@@ -125,7 +151,7 @@ grep -Fxq -- '--gres=gpu:new_model_80gb:2' "$work/submit.args"
 printf "PARTITION=''\nGRES=''\n" >> "$config"
 fresh
 run schedule --vmem 80
-! grep -q -- '--partition' "$work/sinfo.args"
+if grep -q -- '--partition' "$work/sinfo.args"; then exit 1; fi
 grep -Fxq -- '--gres=gpu:new_model_80gb:1' "$work/submit.args"
 
 # Unknown capacity is never guessed, and all failure paths avoid submission.
