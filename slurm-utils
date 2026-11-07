@@ -6,11 +6,15 @@ fail() { printf 'slurm-utils: %s\n' "$*" >&2; exit 1; }
 help() {
     cat <<'HELP'
 Usage: slurm-utils [--config PATH] schedule|status|connect|set-up|jupyter|cancel
+       slurm-utils [--config PATH] schedule [--vmem GB]
        slurm-utils [--config PATH] jupyter [PORT]
 
 Track one Slurm allocation. Configuration defaults to
 ~/.config/slurm-utils/config.sh (trusted Bash code).
 Existing allocations use saved settings, without loading configuration again.
+schedule --vmem 30 discovers GPU types with at least 30 GB of nominal VRAM,
+prints scheduling estimates, and submits one request for the earliest type.
+The chosen type remains fixed while queued. This overrides the type in GRES.
 connect preserves your current directory and prefers zsh (falls back to Bash).
 When available, login-node tmux keeps the connection alive; new windows and
 panes connect to the same allocation. Run connect again to reattach.
@@ -222,10 +226,18 @@ config="$HOME/.config/slurm-utils/config.sh"
 caller_dir=$(pwd -P)
 command_name=''
 port_override=''
+vmem_gb=''
 while (($#)); do
     case $1 in
         --help|-h) help; exit 0 ;;
         --config) (($# >= 2)) || fail '--config needs a path'; config=$2; shift 2 ;;
+        --vmem)
+            (($# >= 2)) || fail '--vmem needs a positive integer in GB, e.g. --vmem 30'
+            [[ -z $vmem_gb ]] || fail 'Specify --vmem only once'
+            [[ $2 =~ ^([0-9]{1,6})([Gg]([Bb])?)?$ ]] || fail '--vmem must be a positive integer in GB'
+            vmem_gb=$((10#${BASH_REMATCH[1]}))
+            ((vmem_gb > 0)) || fail '--vmem must be positive'
+            shift 2 ;;
         schedule|status|connect|set-up|jupyter|cancel)
             [[ -z $command_name ]] || fail 'Specify one command'
             command_name=$1; shift ;;
@@ -240,6 +252,7 @@ while (($#)); do
     esac
 done
 [[ -n $command_name ]] || { help; exit 1; }
+[[ -z $vmem_gb || $command_name = schedule ]] || fail '--vmem is only supported by schedule'
 state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/slurm-utils"
 [[ $state_dir = /* ]] || fail 'State directory must be absolute'
 mkdir -p -- "$state_dir"
@@ -275,6 +288,14 @@ validate_config() {
     for name in JOB_NAME PARTITION GRES CPUS_PER_TASK MEMORY TIME_LIMIT LOG_DIR SCRATCH_ROOTS; do
         [[ ${!name+x} ]] || fail "Configuration must define $name (PARTITION and GRES may be empty)"
     done
+    if declare -p GPU_MEMORY_GB >/dev/null 2>&1; then
+        declaration=$(declare -p GPU_MEMORY_GB)
+        [[ $declaration = 'declare -A '* ]] || fail 'GPU_MEMORY_GB must be an associative array'
+        for name in "${!GPU_MEMORY_GB[@]}"; do
+            [[ $name =~ ^[a-zA-Z0-9_.-]+$ && ${GPU_MEMORY_GB[$name]} =~ ^[1-9][0-9]{0,5}$ ]] ||
+                fail 'GPU_MEMORY_GB must map GPU type names to positive integer GB capacities'
+        done
+    fi
     JUPYTER_PORT=${JUPYTER_PORT-1234}
     for name in JOB_NAME MEMORY TIME_LIMIT LOG_DIR; do
         [[ -n ${!name} && ${!name} != *$'\n'* ]] || fail "Invalid $name"
@@ -297,6 +318,86 @@ validate_config() {
     [[ -w $LOG_DIR ]] || fail 'LOG_DIR is not writable'
 }
 
+
+# Slurm advertises GPU types, not portable VRAM capacities. Recognize explicit
+# capacity suffixes (including MIG profiles), then exact known models. Unknown
+# types are excluded unless the site supplies GPU_MEMORY_GB in its trusted config.
+gpu_memory_gb() {
+    local type=$1 model=${1#nvidia_}
+    if declare -p GPU_MEMORY_GB >/dev/null 2>&1 && [[ -n ${GPU_MEMORY_GB[$type]:-} ]]; then
+        printf '%s\n' "${GPU_MEMORY_GB[$type]}"
+    elif [[ $type =~ (^|[_.-])([1-9][0-9]{0,5})gb$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[2]}"
+    else
+        case $model in
+            a40|l40|l40s|rtx_a6000|rtx_6000_ada_generation) printf '48\n' ;;
+            h200|h200_nvl) printf '141\n' ;;
+            rtx_pro_6000_blackwell_server_edition|rtx_pro_6000_blackwell_workstation_edition)
+                printf '96\n' ;;
+            *) return 1 ;;
+        esac
+    fi
+}
+
+select_vmem_gpu() {
+    local inventory entries entry type capacity count=1 estimate start
+    local best_start='' best_gres='' best_capacity='' i
+    local -a inventory_args=(--noheader --format=%G) candidates=() capacities=()
+    local -A seen_types=()
+    # --vmem replaces only a single GPU request, preserving its count.
+    if [[ -n $GRES ]]; then
+        [[ $GRES =~ ^gpu(:[a-zA-Z0-9_.-]+)?:([1-9][0-9]*)$ ]] ||
+            fail '--vmem requires GRES to be empty or a single gpu[:type]:count request'
+        count=${BASH_REMATCH[2]}
+    fi
+    [[ -z $PARTITION ]] || inventory_args+=("--partition=$PARTITION")
+    inventory=$(sinfo "${inventory_args[@]}") || fail 'GPU inventory query failed; no job submitted'
+    # Remove topology annotations before splitting the comma-separated GRES list.
+    entries=$(printf '%s\n' "$inventory" | sed 's/([^)]*)//g' | tr ',' '\n' | LC_ALL=C sort -u)
+    while IFS= read -r entry; do
+        [[ $entry =~ ^[[:space:]]*gpu:([a-zA-Z0-9_.-]+):[1-9][0-9]*[[:space:]]*$ ]] || continue
+        type=${BASH_REMATCH[1]}
+        [[ -z ${seen_types[$type]:-} ]] || continue
+        seen_types[$type]=1
+        if ! capacity=$(gpu_memory_gb "$type"); then
+            printf 'Skipping GPU %s: unknown VRAM capacity (set GPU_MEMORY_GB in config).\n' "$type" >&2
+            continue
+        fi
+        if ((capacity >= vmem_gb)); then
+            candidates+=("gpu:$type:$count")
+            capacities+=("$capacity")
+        fi
+    done <<< "$entries"
+    ((${#candidates[@]} > 0)) || fail "No advertised GPU type meets --vmem $vmem_gb GB; no job submitted"
+    printf 'Considering GPUs with at least %s GB VRAM per GPU (count %s):\n' "$vmem_gb" "$count" >&2
+    for i in "${!candidates[@]}"; do
+        printf '  %s (%s GB per GPU)\n' "${candidates[$i]}" "${capacities[$i]}" >&2
+    done
+    for i in "${!candidates[@]}"; do
+        if ! estimate=$(LC_ALL=C TZ=UTC SLURM_TIME_FORMAT=standard sbatch --test-only "${args[@]}" \
+            "--gres=${candidates[$i]}" "$LAUNCH_DIR/batch.sh" 2>&1); then
+            printf '  %s: estimate unavailable: %s\n' "${candidates[$i]}" "$estimate" >&2
+            continue
+        fi
+        if [[ $estimate =~ to\ start\ at\ ([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}) ]]; then
+            start=${BASH_REMATCH[1]}
+            printf '  %s: estimated start %s UTC\n' "${candidates[$i]}" "$start" >&2
+            # ISO timestamps sort chronologically; stable ties follow type order.
+            if [[ -z $best_start || $start < $best_start ]]; then
+                best_start=$start
+                best_gres=${candidates[$i]}
+                best_capacity=${capacities[$i]}
+            fi
+        else
+            printf '  %s: no usable start estimate: %s\n' "${candidates[$i]}" "$estimate" >&2
+        fi
+    done
+    [[ -n $best_gres ]] || fail 'No qualifying GPU has a scheduling estimate; no job submitted'
+    GRES=$best_gres
+    printf 'Chosen GPU: %s (%s GB per GPU); expected start %s UTC.\n' "$GRES" "$best_capacity" "$best_start" >&2
+    printf 'Start time is an estimate; the submitted GPU type remains fixed while queued.\n' >&2
+}
+
 case $command_name in
     schedule)
         exec 9> "$state_dir/lock"
@@ -306,7 +407,7 @@ case $command_name in
             finished || fail "Allocation $JOB_ID is still $JOB_STATE"
         fi
         # Clear previous settings and inherited configuration values.
-        unset JOB_NAME PARTITION GRES CPUS_PER_TASK MEMORY TIME_LIMIT LOG_DIR SCRATCH_ROOTS KEYTAB ENV_SETUP JUPYTER_PORT
+        unset GPU_MEMORY_GB JOB_NAME PARTITION GRES CPUS_PER_TASK MEMORY TIME_LIMIT LOG_DIR SCRATCH_ROOTS KEYTAB ENV_SETUP JUPYTER_PORT
         [[ -r $config ]] || fail "Missing configuration: $config; copy config.example.sh there and edit it"
         # shellcheck disable=SC1090
         source "$config"
@@ -336,6 +437,11 @@ case $command_name in
             "--output=$LOG_DIR/slurm-utils-%j.out" "--error=$LOG_DIR/slurm-utils-%j.err"
             "--chdir=$HOME" --export=ALL)
         [[ -z $PARTITION ]] || args+=("--partition=$PARTITION")
+        if [[ -n $vmem_gb ]]; then
+            select_vmem_gpu
+            # Snapshot the actual typed request selected before the only submission.
+            printf 'GRES=%q\n' "$GRES" >> "$LAUNCH_DIR/settings.sh"
+        fi
         [[ -z $GRES ]] || args+=("--gres=$GRES")
         result=$(sbatch "${args[@]}" "$LAUNCH_DIR/batch.sh") || fail 'Submission failed; previous state preserved'
         [[ $result =~ ^([0-9]+)(\;[a-zA-Z0-9_.-]+)?$ ]] ||
