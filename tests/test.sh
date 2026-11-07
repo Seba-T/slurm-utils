@@ -9,6 +9,16 @@ export REAL_BASH
 REAL_BASH=$(command -v bash)
 mkdir -p "$HOME" "$MOCK/bin" "$work/scratch space"
 export PATH="$MOCK/bin:$PATH"
+# Exercise the direct fallback regardless of whether the test host has tmux.
+cat > "$work/bash-env" <<'MOCK'
+command() {
+    if [[ $* = '-v tmux' ]]; then return 1; fi
+    if [[ ${MOCK_MISSING_ZSH:-} = 1 && $* = '-v zsh' ]]; then return 1; fi
+    if [[ ${MOCK_MISSING_CHSH:-} = 1 && $* = '-v chsh' ]]; then return 1; fi
+    builtin command "$@"
+}
+MOCK
+export BASH_ENV="$work/bash-env"
 cat > "$MOCK/bin/sbatch" <<'MOCK'
 #!/usr/bin/env bash
 printf '%s\n' "$@" > "$MOCK/sbatch.args"
@@ -132,13 +142,7 @@ if [[ ${1:-} = --login ]]; then
 fi
 exec "$REAL_BASH" "$@"
 MOCK
-cat > "$work/bash-env" <<'MOCK'
-command() {
-    if [[ ${MOCK_MISSING_ZSH:-} = 1 && $* = '-v zsh' ]]; then return 1; fi
-    if [[ ${MOCK_MISSING_CHSH:-} = 1 && $* = '-v chsh' ]]; then return 1; fi
-    builtin command "$@"
-}
-MOCK
+
 chmod +x "$MOCK/bin/bash"
 (cd "$work/project space"; env BASH_ENV="$work/bash-env" MOCK_MISSING_ZSH=1 "$repo/slurm-utils" --config "$config" connect) 2> "$work/connect.error"
 [[ $(head -n 1 "$MOCK/bash-shell") = "$work/project space" ]]

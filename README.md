@@ -120,6 +120,20 @@ node placeholder. Before scratch metadata arrives, attachment reports
 `bash --login` with a message if zsh is unavailable. It starts in the same
 directory from which you ran `connect`; that path must exist on the compute
 node. An unavailable directory fails rather than silently starting elsewhere.
+
+If `tmux` is installed on the login node, `connect` creates a session there
+for the allocation and attaches to it. The first window and every new tmux
+window (`Ctrl-b c`) or split pane (`Ctrl-b %` or `Ctrl-b "`) start a separate
+interactive `srun` step on the compute node. New shells use the directory from
+the first `connect`. Detach with `Ctrl-b d`; run `slurm-utils connect` on the
+same login node to reattach. From an existing login-node tmux client, `connect`
+switches to the allocation session. Other tmux sessions keep their settings.
+Without tmux, `connect` opens the compute shell directly.
+
+These shortcuts create tmux windows/panes. A new tab in your terminal app or
+VS Code still starts on its configured host; run `slurm-utils connect` there
+to attach. Keeping tmux on the login node does not extend the Slurm time limit.
+
 `jupyter` opens a
 foreground step and runs `jupyter notebook --no-browser --ip=0.0.0.0` with the
 configured port (or the optional `jupyter PORT` argument) and zero port retries.
@@ -250,9 +264,11 @@ and must be handled separately.
 ## Validation
 
 ```bash
-bash -n slurm-utils install.sh config.example.sh tests/test.sh
-shellcheck slurm-utils install.sh config.example.sh tests/test.sh
+bash -n slurm-utils install.sh config.example.sh tests/test.sh tests/tmux.sh
+shellcheck slurm-utils install.sh config.example.sh tests/test.sh tests/tmux.sh
 bash tests/test.sh
+# With tmux installed (uses an isolated temporary tmux server):
+bash tests/tmux.sh
 ```
 
 Tests use temporary directories and fake Slurm/Jupyter commands. They cover
@@ -265,13 +281,17 @@ paths for venv, direnv, and login-shell changes. No cluster or Jupyter installat
 needed. Tests also cover optional package installation and registration,
 missing pip, package/kernel failures, project environment selection, and port
 overrides and validation. ShellCheck is a development-only dependency.
+The tmux integration test checks new windows and split panes, reattachment,
+session recreation, quoted paths, and preservation of unrelated sessions.
 
 Before relying on a real cluster:
 
 1. Configure a small allocation with a GPU and run `schedule`, then `status`
    until running and initialized. Check both log paths.
 2. Run `connect`, verify `hostname`, `nvidia-smi`, and write a test file in
-   `$SCRATCH_DIR`. Exit and confirm the reservation remains running.
+   `$SCRATCH_DIR`. If tmux is available, create a window and split pane and
+   verify they also run on the compute node. Detach and run `connect` again
+   to verify reattachment. Exit and confirm the reservation remains running.
 3. Run `jupyter`, connect VS Code Remote SSH using the printed URL, and execute
    a notebook cell checking the hostname and GPU visibility in the intended
    environment. Confirm a second launch on the same port fails.

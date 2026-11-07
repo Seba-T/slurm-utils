@@ -12,6 +12,8 @@ Track one Slurm allocation. Configuration defaults to
 ~/.config/slurm-utils/config.sh (trusted Bash code).
 Existing allocations use saved settings, without loading configuration again.
 connect preserves your current directory and prefers zsh (falls back to Bash).
+When available, login-node tmux keeps the connection alive; new windows and
+panes connect to the same allocation. Run connect again to reattach.
 set-up prepares .venv, direnv, and zsh in this directory inside a running job,
 asking for confirmation before each change. Jupyter defaults to port 1234.
 set-up can optionally install Notebook/ipykernel and register the .venv kernel.
@@ -60,6 +62,38 @@ batch_main() {
         fi
     fi
     while :; do sleep 3600 & sleeper=$!; wait "$sleeper"; done
+}
+
+connect_tmux() {
+    local session="slurm-utils-$JOB_ID-${LAUNCH_DIR##*.}"
+    local launcher bash_path default_command
+    bash_path=$(command -v bash)
+    # Serialize creation, but never leave the lock open in the tmux server.
+    exec 9> "$LAUNCH_DIR/connect.lock"
+    flock -x 9
+    if ! tmux has-session -t "=$session" 9>&- 2>/dev/null; then
+        launcher=$(mktemp "$LAUNCH_DIR/connect.XXXXXXXX")
+        {
+            printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+            # A pre-existing tmux server may have an older module/PATH setup.
+            printf 'export PATH=%q\n' "$PATH"
+            printf 'exec '
+            printf '%q ' "$@"
+            printf '\n'
+        } > "$launcher"
+        printf -v default_command 'exec %q %q' "$bash_path" "$launcher"
+        # The first pane receives argv directly; subsequent panes use Bash to
+        # interpret the quoted command. Options apply only to this session.
+        tmux new-session -d -s "$session" -c "$caller_dir" "$bash_path" "$launcher" \; \
+            set-option -t "$session" default-shell "$bash_path" \; \
+            set-option -t "$session" default-command "$default_command" 9>&- ||
+            fail 'Could not create the compute tmux session'
+    fi
+    exec 9>&-
+    if [[ -n ${TMUX:-} ]]; then
+        exec tmux switch-client -t "=$session"
+    fi
+    exec tmux attach-session -t "=$session"
 }
 
 # Used locally and copied into the setup step so prompts remain interactive.
@@ -349,7 +383,9 @@ case $command_name in
         if [[ $command_name = connect ]]; then
             # Positional parameters are expanded by the remote Bash.
             # shellcheck disable=SC2016
-            exec "${step[@]}" --chdir="$caller_dir" --pty bash -c '
+            connection=("${step[@]}" --chdir="$caller_dir" --pty bash -c '
+                # The tmux server lives on the login node, not this node.
+                unset TMUX TMUX_PANE
                 export SCRATCH_DIR=$1
                 cd -- "$2" || { echo "Project directory unavailable: $2" >&2; exit 1; }
                 if command -v zsh >/dev/null; then
@@ -358,7 +394,11 @@ case $command_name in
                 fi
                 echo "zsh unavailable; falling back to Bash" >&2
                 exec bash --login
-            ' bash "$scratch" "$caller_dir"
+            ' bash "$scratch" "$caller_dir")
+            if command -v tmux >/dev/null; then
+                connect_tmux "${connection[@]}"
+            fi
+            exec "${connection[@]}"
         fi
         # Positional parameters and token generation belong to the remote Bash.
         # shellcheck disable=SC2016
