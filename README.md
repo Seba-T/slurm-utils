@@ -5,7 +5,7 @@ Jupyter. It tracks one current allocation per state directory.
 
 ## Requirements and installation
 
-Use Linux x86-64 with Bash 4+, standard Linux utilities (including `flock` from
+Use Linux x86-64 with Bash 4+, Git on the login node, standard Linux utilities (including `flock` from
 util-linux), and working `sbatch`, `squeue`, `srun`, and `scancel` commands.
 No compilation, root access, package manager, or Python runtime is needed by
 this utility. Jupyter Notebook must be available on the compute node for the
@@ -77,11 +77,26 @@ ENV_SETUP="$HOME/jupyter-environment.sh"
 source "$HOME/venvs/notebooks/bin/activate"
 ```
 
-The utility sources that file before launching Jupyter. Otherwise it uses
-`.venv/bin/jupyter` in the current project directory when present, or the
-available `jupyter` command. The `jupyter` command does not install environments.
-Connected shells use normal login startup files; `ENV_SETUP` applies only to Jupyter.
-To create a project environment interactively, use `set-up` below.
+For repository-specific CUDA modules or other activation, register an
+environment-only script for each physical Git checkout in the trusted config:
+
+```bash
+declare -A PROJECT_ENVS=(
+  ["$HOME/project-a"]="$HOME/project-a/config-env.sh"
+  ["$HOME/project-b"]="$HOME/project-b/activate.sh"
+)
+```
+
+Jupyter sources the matching script and prefers the caller's local
+`.venv/bin/jupyter`, then the checkout root's `.venv/bin/jupyter`. Without a
+matching script or virtual environment it uses a shared `ENV_SETUP` if supplied,
+then runs `jupyter` from PATH. A legacy `ENV_SETUP` inside a Git checkout is
+ignored, including for running allocations. Move any activation you need from
+that file into `PROJECT_ENVS` when scheduling your next allocation.
+
+Connected shells use their normal login and direnv startup. Move any data
+transfers out of `.envrc`, login files and activation scripts into the
+schedule-time hooks below. Shell startup code runs whenever that shell opens.
 
 ## Workflow
 
@@ -108,6 +123,68 @@ slurm-utils cancel
 sleeps until cancellation or the time limit. Scheduling again while the current
 job is active fails with its ID and state. A successful queue query confirming
 that the job has finished permits replacement. Query failures preserve state.
+
+### Stage one project's data on the compute node
+
+From a trusted checkout (or one of its subdirectories), use:
+
+```bash
+slurm-utils schedule --migrate-scratch
+```
+
+Provide two executable scripts at the checkout root, `bin/stage-scratch` and
+`bin/sync-scratch`. Outside Git, the scheduling directory serves as the root.
+Both scripts run on the allocated node with that root as their working directory,
+`PROJECT_DIR` set to the root, and `SCRATCH_DIR` set to the job's private scratch.
+Plain `schedule` still creates empty scratch and runs neither script.
+
+For example, a project that reads/writes `$SCRATCH_DIR/data` can use these
+scripts. The shared `data` directory must exist before scheduling.
+
+```bash
+#!/usr/bin/env bash
+# bin/stage-scratch
+set -eu
+mkdir -p -- "$SCRATCH_DIR/data"
+rsync -a -- "$PROJECT_DIR/data/" "$SCRATCH_DIR/data/"
+```
+
+```bash
+#!/usr/bin/env bash
+# bin/sync-scratch
+set -eu
+rsync -a -- "$SCRATCH_DIR/data/" "$PROJECT_DIR/data/"
+```
+
+Make each file start with its shebang and run `chmod +x bin/{stage,sync}-scratch`.
+Keep the scripts on shared storage for the life of the allocation. Stage-in runs
+once at batch startup. Interactive steps become available after it succeeds.
+You can connect or start Jupyter from other checkouts on that allocation.
+Only the project that requested migration is copied.
+
+Migrated jobs request `--signal=B:USR1@300` and disable automatic requeue onto
+another node. About five minutes before the time limit, or on an earlier
+`slurm-utils cancel`, the utility closes admission for its shells, Jupyter
+servers, setup steps and new tmux panes. It sends SIGTERM to the allocation's
+numeric workload steps, including steps from other checkouts on that allocation.
+The copy-back helper, batch shell, extern step and other allocations are excluded.
+After Slurm reports the workload steps have exited, the helper runs
+`bin/sync-scratch` on the compute node and records successful completion under
+a lock. A cancel during the warning waits for the same transfer before releasing
+the job. A later warning, TERM or repeated cancel reuses that success.
+
+A failed step query, a step still alive after 60 seconds, or a failed transfer
+leaves copy-back pending. The utility keeps the job tracked for retry with
+`slurm-utils cancel`; the batch shell also retries on TERM. Cancelling a pending
+job skips the transfer. A hook receives `SCRATCH_SYNC_REASON` (`warning`, `exit`
+or `cancel`) and can read metadata its staging hook saved in job scratch.
+
+The drain covers processes supervised by Slurm workload steps. Keep writers
+inside these steps and avoid starting raw `srun` or SSH workloads during drain.
+The job's `SLURM_UTILS_DRAIN_FILE` path is exported to stage-in and managed steps.
+Its presence tells cooperating processes to stop launching work. Size checkpoint
+flushes and transfers for the time available. A hard deadline or node loss can
+interrupt a transfer.
 
 ### Choose a GPU by video memory
 
@@ -178,11 +255,11 @@ directory from which you ran `connect`; that path must exist on the compute
 node. An unavailable directory fails rather than silently starting elsewhere.
 
 If `tmux` is installed on the login node, `connect` creates a session there
-for the allocation and attaches to it. The first window and every new tmux
+for the current checkout on that allocation and attaches to it. The first window and every new tmux
 window (`Ctrl-b c`) or split pane (`Ctrl-b %` or `Ctrl-b "`) start a separate
 interactive `srun` step on the compute node. New shells use the directory from
 the first `connect`. Detach with `Ctrl-b d`; run `slurm-utils connect` on the
-same login node to reattach. From an existing login-node tmux client, `connect`
+same login node from the same checkout to reattach. From an existing login-node tmux client, `connect`
 switches to the allocation session. Other tmux sessions keep their settings.
 Without tmux, `connect` opens the compute shell directly.
 
@@ -297,8 +374,8 @@ On the compute node, the first usable configured scratch root gets a private
 `<root>/<user>/<job-id>` directory. No usable root causes a clear batch error.
 Scratch metadata is job-specific and written to shared state. Scratch is
 usually local to that compute node, not the login node. The utility **never
-deletes scratch data**. Copy valuable output elsewhere before ending the
-allocation; cluster cleanup policy may remove scratch independently.
+deletes scratch data**. Use the migration hooks or copy valuable output
+elsewhere before ending the allocation; cluster cleanup policy may remove scratch independently.
 
 Launch directories and logs are retained after cancellation for inspection.
 Remove obsolete files manually when no job needs them. The scope excludes
@@ -320,10 +397,11 @@ and must be handled separately.
 ## Validation
 
 ```bash
-bash -n slurm-utils install.sh config.example.sh tests/test.sh tests/tmux.sh tests/vmem.sh
-shellcheck slurm-utils install.sh config.example.sh tests/test.sh tests/tmux.sh tests/vmem.sh
+bash -n slurm-utils install.sh config.example.sh tests/test.sh tests/tmux.sh tests/vmem.sh tests/migration.sh
+shellcheck slurm-utils install.sh config.example.sh tests/test.sh tests/tmux.sh tests/vmem.sh tests/migration.sh
 bash tests/test.sh
 bash tests/vmem.sh
+bash tests/migration.sh
 # With tmux installed (uses an isolated temporary tmux server):
 bash tests/tmux.sh
 ```

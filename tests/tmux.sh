@@ -43,7 +43,11 @@ mkdir -p "$launch"
 printf 'JOB_ID=123\nLAUNCH_DIR=%q\n' "$launch" > "$XDG_STATE_HOME/slurm-utils/current"
 printf 'LOG_DIR=%q\n' "$work" > "$launch/settings.sh"
 printf '%s\n' "$work/scratch ' space" > "$launch/scratch-123"
-session=slurm-utils-123-test
+project="$work/project ' space"
+git init -q "$project"
+mkdir "$project/subdir"
+git init -q "$work/second/project ' space"
+session=''
 wait_shells() {
     for ((i=0; i<100; i++)); do
         if [[ -f $work/shells ]] && [[ $(wc -l < "$work/shells") = "$1" ]]; then return; fi
@@ -60,6 +64,7 @@ tmux set-option -t unrelated default-command 'sleep 120'
 (cd "$work/project ' space" && "$repo/slurm-utils" connect)
 wait_shells 1
 grep -Fxq attach-session "$work/attach"
+session=$(tmux list-sessions -F '#{session_name}' | grep '^slurm-utils-')
 grep -Fxq "=$session" "$work/attach"
 [[ $(tmux show-option -v -t unrelated default-command) = 'sleep 120' ]]
 
@@ -70,10 +75,10 @@ wait_shells 3
 expected="$work/project ' space|$work/scratch ' space|unset|unset|--login"
 [[ $(grep -Fxc -- "$expected" "$work/shells") = 3 ]]
 
-# Reconnecting from a different directory keeps the existing session/launcher.
-(cd "$work" && timeout 5 "$repo/slurm-utils" connect)
+# Reconnecting from a subdirectory reuses the checkout session.
+(cd "$project/subdir" && timeout 5 "$repo/slurm-utils" connect)
 [[ $(wc -l < "$work/shells") = 3 ]]
-TMUX=existing-client timeout 5 "$repo/slurm-utils" connect
+(cd "$project" && TMUX=existing-client timeout 5 "$repo/slurm-utils" connect)
 grep -Fxq switch-client "$work/attach"
 tmux new-window -t "=$session"
 wait_shells 4
@@ -83,4 +88,8 @@ wait_shells 4
 tmux kill-session -t "=$session"
 (cd "$work/project ' space" && timeout 5 "$repo/slurm-utils" connect)
 wait_shells 5
+(cd "$work/second/project ' space" && timeout 5 "$repo/slurm-utils" connect)
+wait_shells 6
+grep -Fxq "$work/second/project ' space|$work/scratch ' space|unset|unset|--login" "$work/shells"
+[[ $(tmux list-sessions -F '#{session_name}' | grep -c '^slurm-utils-') = 2 ]]
 echo 'All tmux integration tests passed'
