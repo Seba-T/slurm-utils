@@ -1,34 +1,39 @@
 # slurm-utils
 
-One Bash executable for reserving a Slurm node, opening a shell, and running
-Jupyter. It tracks one current allocation per state directory.
+A single Bash script that reserves a Slurm node, opens a shell on it, and runs Jupyter there. It tracks one current allocation at a time.
 
-## Requirements and installation
+```bash
+slurm-utils schedule     # request a node
+slurm-utils status       # wait until RUNNING
+slurm-utils connect      # shell on the node
+slurm-utils jupyter      # Jupyter on the node
+slurm-utils cancel       # release the node
+```
 
-Use Linux x86-64 with Bash 4+, Git on the login node, standard Linux utilities (including `flock` from
-util-linux), and working `sbatch`, `squeue`, `srun`, and `scancel` commands.
-No compilation, root access, package manager, or Python runtime is needed by
-this utility. Jupyter Notebook must be available on the compute node for the
-`jupyter` command; `set-up` can optionally install it in your project environment.
-Optional Kerberos renewal uses `k5start` and a keytab.
-The optional `set-up` command needs Python 3 with `venv` support, zsh, curl,
-and network access from the compute node to download direnv.
+Shells and Jupyter run as `srun --overlap` steps inside the reservation, so closing either one leaves the node yours until you `cancel` or the time limit hits.
 
-Your home directory and state directory **must be shared between login and
-compute nodes**, at the same absolute paths. Use one Slurm cluster per state
-directory. The Slurm controller must permit overlapping job steps.
+## Requirements
 
-Install on the cluster's login node with `curl` and Bash:
+- Linux x86-64, Bash 4+, Git on the login node, `flock` (util-linux), and working `sbatch`, `squeue`, `srun`, `scancel`.
+- Your home directory and the state directory must be **shared between login and compute nodes, at the same absolute paths**.
+- The Slurm controller must allow overlapping job steps.
+- Jupyter Notebook on the compute node (for `jupyter`). `set-up` can install it for you.
+- Optional: `tmux` on the login node; `k5start` plus a keytab for Kerberos renewal.
+- Only for `set-up`: Python 3 with `venv`, zsh, curl, and compute-node network access (to download direnv).
+
+No compilation, root access, or package manager needed.
+
+## Install
+
+On the cluster's login node:
 
 ```bash
 curl -sfL https://raw.githubusercontent.com/Seba-T/slurm-utils/main/install.sh | bash
 ```
 
-This installs `~/.local/bin/slurm-utils` and creates the example configuration
-at `~/.config/slurm-utils/config.sh` if it does not exist. Run the same command
-to upgrade; your configuration is preserved.
+This installs `~/.local/bin/slurm-utils` and creates `~/.config/slurm-utils/config.sh` from the example if it doesn't exist. Rerun the same command to upgrade; your config is kept (compare it against the new example rather than overwriting it).
 
-Or, from a downloaded copy of this directory:
+Manual install from a clone:
 
 ```bash
 mkdir -p ~/.local/bin ~/.config/slurm-utils
@@ -36,49 +41,45 @@ install -m 755 slurm-utils ~/.local/bin/slurm-utils
 install -m 600 config.example.sh ~/.config/slurm-utils/config.sh
 ```
 
-Add this to your shell startup file if needed, then open a new shell:
+Make sure `~/.local/bin` is on your `PATH`:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Edit `~/.config/slurm-utils/config.sh` for your cluster before scheduling.
-The example contains sample resource settings, **not built-in defaults**.
-Configuration is trusted Bash code, sourced with your privileges. Review any
-configuration before using it. `--config PATH` selects a different file; it does
-not select a separate allocation or state directory.
+## Configure
 
-## Configuration
+Edit `~/.config/slurm-utils/config.sh`. The values in the example are samples, **not defaults**. The file is sourced as Bash with your privileges, so only use configs you trust. `--config PATH` selects a different file; it does not create a separate allocation or state directory.
 
-All resource variables must be explicitly set: `JOB_NAME`, `PARTITION`, `GRES`,
-`CPUS_PER_TASK`, `MEMORY`, and `TIME_LIMIT`. Empty `PARTITION` or `GRES` omits
-that option, allowing the cluster's policy to apply. Slurm validates cluster
-specific resource names and time limits. `MEMORY` accepts an integer with an
-optional K/M/G/T suffix; `TIME_LIMIT` accepts Slurm numeric time forms such as
-`08:00:00` or `2-00:00:00`.
+| Variable | Required | Notes |
+|---|---|---|
+| `JOB_NAME` | yes | |
+| `PARTITION` | yes | Empty omits the option (cluster default applies). |
+| `GRES` | yes | Empty omits the option. Must be empty or a single `gpu[:type]:count`. |
+| `CPUS_PER_TASK` | yes | |
+| `MEMORY` | yes | Integer with optional `K`/`M`/`G`/`T` suffix. |
+| `TIME_LIMIT` | yes | Slurm time format, e.g. `08:00:00` or `2-00:00:00`. |
+| `LOG_DIR` | yes | Absolute path, no `%` characters. |
+| `SCRATCH_ROOTS` | yes | Non-empty Bash array of absolute paths. |
+| `JUPYTER_PORT` | no | 1–65535, default 1234. |
+| `KEYTAB` | no | If set and `k5start` is on the compute node, ticket renewal starts with the job. A renewal failure is logged but doesn't end the job. |
+| `ENV_SETUP` | no | Absolute path to a shell file sourced before Jupyter. Must be readable on the compute node. |
+| `PROJECT_ENVS` | no | Per-checkout activation scripts (see below). |
 
-Also set `LOG_DIR` (absolute, no `%` characters) and `SCRATCH_ROOTS` (a nonempty
-Bash array of absolute paths). `JUPYTER_PORT` is optional and defaults to 1234;
-an explicit value must be 1–65535. Existing configurations and allocation
-snapshots keep their saved port; change your configuration and schedule a new
-allocation to use a different port. Paths containing spaces are supported
-when quoted in the configuration.
+Slurm itself validates partition, GRES, and time-limit values. Paths with spaces work if quoted.
 
-`KEYTAB` and `ENV_SETUP` are optional and may be empty. If `k5start` is on the
-compute node's PATH and the keytab exists, the reservation starts ticket
-renewal. Startup failure is reported in the batch error log but does not end
-the reservation. `ENV_SETUP` must be an absolute readable shell setup file,
-available on the compute node. For example:
+A saved allocation keeps the port it was scheduled with. To change the port, edit the config and schedule a new allocation.
 
-```bash
-# In config.sh:
-ENV_SETUP="$HOME/jupyter-environment.sh"
-# In ~/jupyter-environment.sh:
-source "$HOME/venvs/notebooks/bin/activate"
-```
+### Jupyter environment
 
-For repository-specific CUDA modules or other activation, register an
-environment-only script for each physical Git checkout in the trusted config:
+Jupyter picks its environment in this order:
+
+1. The `PROJECT_ENVS` script matching your Git checkout, if any.
+2. `.venv/bin/jupyter` in the directory you ran the command from, then in the checkout root.
+3. `ENV_SETUP`, if set.
+4. `jupyter` from `PATH`.
+
+Register an environment-only script (e.g. to load CUDA modules) per checkout:
 
 ```bash
 declare -A PROJECT_ENVS=(
@@ -87,59 +88,113 @@ declare -A PROJECT_ENVS=(
 )
 ```
 
-Jupyter sources the matching script and prefers the caller's local
-`.venv/bin/jupyter`, then the checkout root's `.venv/bin/jupyter`. Without a
-matching script or virtual environment it uses a shared `ENV_SETUP` if supplied,
-then runs `jupyter` from PATH. A legacy `ENV_SETUP` inside a Git checkout is
-ignored, including for running allocations. Move any activation you need from
-that file into `PROJECT_ENVS` when scheduling your next allocation.
+An `ENV_SETUP` file that lives inside a Git checkout is ignored, even for running allocations. Move what you need into `PROJECT_ENVS` before scheduling your next one.
 
-Connected shells use their normal login and direnv startup. Move any data
-transfers out of `.envrc`, login files and activation scripts into the
-schedule-time hooks below. Shell startup code runs whenever that shell opens.
+Shells you open with `connect` use your normal login and direnv startup, and that code runs every time a shell opens. Keep data transfers out of `.envrc` and login files; use [`--migrate-scratch`](#stage-project-data-on-the-compute-node) instead.
 
-## Workflow
+## Commands
 
-Run these commands on the login node:
+### `schedule`
+
+Submits a single-node, single-task job with `sbatch --parsable`. The batch process prepares scratch, starts Kerberos renewal if configured, and sleeps until cancelled or out of time.
+
+Scheduling again while the current job is active fails and prints its ID and state. If a queue query confirms the job has finished, the new one replaces it. If the query itself fails, nothing changes.
+
+Options: [`--vmem`](#pick-a-gpu-by-vram), [`--migrate-scratch`](#stage-project-data-on-the-compute-node).
+
+### `status`
+
+Prints the job ID, queue state, assigned node, scratch path (when known), and stdout/stderr log paths.
+
+- `FINISHED` only means the job left the queue, not that it succeeded. Check the logs or `sacct`.
+- For a pending job, Slurm may show a placeholder node.
+- Before scratch metadata arrives, `connect` says "initializing; retry shortly." If that persists, check the batch logs.
+
+### `connect`
+
+Opens `zsh --login` in an interactive `srun` step (falling back to `bash --login` with a message if zsh is missing). It starts in the directory you ran it from, which must exist on the compute node; otherwise it fails rather than starting somewhere else. `SCRATCH_DIR` is exported.
+
+With `tmux` on the login node, `connect` creates (or reattaches to) one session per checkout per allocation:
+
+- Every new window (`Ctrl-b c`) and split (`Ctrl-b %`, `Ctrl-b "`) starts its own `srun` step on the compute node, in the directory of the first `connect`.
+- Detach with `Ctrl-b d`; rerun `slurm-utils connect` from the same checkout on the same login node to reattach.
+- From inside an existing tmux client, it switches to the allocation's session. Other sessions are untouched.
+- A new terminal tab or VS Code terminal still opens on its own host. Run `slurm-utils connect` there.
+
+Without tmux, you just get the compute-node shell.
+
+### `jupyter [PORT]`
+
+Runs `jupyter notebook --no-browser --ip=0.0.0.0` as a foreground step, in the directory you ran it from. `PORT` (1–65535) overrides the configured port for this launch only. Ctrl-C stops Jupyter; the reservation stays.
+
+Each launch generates a fresh 256-bit token and prints a compute-node URL. In VS Code over Remote SSH, choose "existing Jupyter server" and paste it once Jupyter reports ready. Things to know:
+
+- **Treat the URL as a credential.** The server listens on all compute-node interfaces over plain HTTP, so only use it on a trusted cluster network.
+- The login node must be able to resolve the compute hostname and reach the port. No SSH tunnel is created.
+- A port conflict is an error; it never picks another port.
+- See Jupyter's [remote server docs](https://jupyter-server.readthedocs.io/en/latest/operators/public-server.html).
+
+### `cancel`
+
+Calls `scancel`, and clears the current-allocation pointer only after Slurm accepts it. If it fails, the pointer stays so you can retry. Slurm may take a moment to finish tearing the job down.
+
+### `set-up`
+
+Interactive project bootstrap. See [Project setup](#project-setup).
+
+## Pick a GPU by VRAM
 
 ```bash
-slurm-utils schedule
-slurm-utils status
-# Wait for RUNNING and scratch initialization.
-slurm-utils connect
-# Inside the allocation:
-printf '%s\n' "$SCRATCH_DIR"
-exit
-# Back on the login node:
-slurm-utils jupyter
-# Or override the port for this launch only:
-slurm-utils jupyter 1235
-# Ctrl-C stops the Jupyter step; the reservation remains available.
-slurm-utils cancel
+slurm-utils schedule --vmem 30    # also accepts 30G or 30GB
 ```
 
-`schedule` submits a single-node, single-task allocation with `sbatch
---parsable`. The batch process prepares scratch, starts optional renewal, and
-sleeps until cancellation or the time limit. Scheduling again while the current
-job is active fails with its ID and state. A successful queue query confirming
-that the job has finished permits replacement. Query failures preserve state.
+Requests a GPU with at least 30 GB of memory per GPU, whichever type starts soonest:
 
-### Stage one project's data on the compute node
+1. Lists the GPU types in your `PARTITION` (or Slurm's default view) with at least that much VRAM.
+2. Runs [`sbatch --test-only`](https://slurm.schedmd.com/sbatch.html#OPT_test-only) for each type, with the same CPU, RAM, partition, and time as the real request.
+3. Submits **one** job for the type with the earliest estimated start (ties go to alphabetical order). It keeps that type while queued and doesn't switch if the queue changes.
 
-From a trusted checkout (or one of its subdirectories), use:
+```text
+Considering GPUs with at least 30 GB VRAM per GPU (count 1):
+  gpu:a40:1 (48 GB per GPU)
+  gpu:h200_3g.71gb:1 (71 GB per GPU)
+  gpu:a40:1: estimated start 2026-11-07T18:34:45 UTC
+  gpu:h200_3g.71gb:1: estimated start 2026-11-07T14:08:46 UTC
+Chosen GPU: gpu:h200_3g.71gb:1 (71 GB per GPU); expected start 2026-11-07T14:08:46 UTC.
+Start time is an estimate; the submitted GPU type remains fixed while queued.
+Scheduled allocation 123
+```
+
+Details:
+
+- `--vmem` only works with `schedule`. It overrides the GPU type in `GRES` and keeps the count. `GRES` must be empty (one GPU) or a single `gpu[:type]:count`.
+- Slurm has no portable VRAM field, so capacity comes from the type name (`a100_80gb`, MIG `h200_3g.71gb`) or a built-in table: A40, L40, L40S, RTX A6000, RTX 6000 Ada (48 GB); H200 (141 GB); RTX PRO 6000 Blackwell (96 GB). These are nominal capacities, not free memory. Unknown types are skipped with a message.
+- Add site-specific types in your config:
+
+  ```bash
+  declare -A GPU_MEMORY_GB=(
+    [site_specific_gpu]=48
+    [site_mig_profile]=40
+  )
+  ```
+
+- If no type qualifies, the inventory query fails, or no estimate is usable, nothing is submitted and your current allocation is untouched.
+- The chosen typed `GRES` is saved with the allocation settings. `--mem` and `--mem-per-gpu` are about host RAM and don't affect this.
+
+## Stage project data on the compute node
 
 ```bash
 slurm-utils schedule --migrate-scratch
 ```
 
-Provide two executable scripts at the checkout root, `bin/stage-scratch` and
-`bin/sync-scratch`. Outside Git, the scheduling directory serves as the root.
-Both scripts run on the allocated node with that root as their working directory,
-`PROJECT_DIR` set to the root, and `SCRATCH_DIR` set to the job's private scratch.
-Plain `schedule` still creates empty scratch and runs neither script.
+Run it from a Git checkout (or a subdirectory). Outside Git, the current directory is the root. The checkout must contain two executable scripts:
 
-For example, a project that reads/writes `$SCRATCH_DIR/data` can use these
-scripts. The shared `data` directory must exist before scheduling.
+- `bin/stage-scratch`: copies your data into `$SCRATCH_DIR` at job start.
+- `bin/sync-scratch`: copies results back out.
+
+Both run on the compute node with the root as working directory, plus `PROJECT_DIR` (the root) and `SCRATCH_DIR` (the job's private scratch) set. Keep them on shared storage for the life of the allocation. Plain `schedule` creates empty scratch and runs neither.
+
+Example for a project that reads and writes `$SCRATCH_DIR/data` (the shared `data/` directory must exist before scheduling):
 
 ```bash
 #!/usr/bin/env bash
@@ -156,303 +211,76 @@ set -eu
 rsync -a -- "$SCRATCH_DIR/data/" "$PROJECT_DIR/data/"
 ```
 
-Make each file start with its shebang and run `chmod +x bin/{stage,sync}-scratch`.
-Keep the scripts on shared storage for the life of the allocation. Stage-in runs
-once at batch startup. Interactive steps become available after it succeeds.
-You can connect or start Jupyter from other checkouts on that allocation.
-Only the project that requested migration is copied.
+Then `chmod +x bin/stage-scratch bin/sync-scratch`.
 
-Migrated jobs request `--signal=B:USR1@300` and disable automatic requeue onto
-another node. About five minutes before the time limit, or on an earlier
-`slurm-utils cancel`, the utility closes admission for its shells, Jupyter
-servers, setup steps and new tmux panes. It sends SIGTERM to the allocation's
-numeric workload steps, including steps from other checkouts on that allocation.
-The copy-back helper, batch shell, extern step and other allocations are excluded.
-After Slurm reports the workload steps have exited, the helper runs
-`bin/sync-scratch` on the compute node and records successful completion under
-a lock. A cancel during the warning waits for the same transfer before releasing
-the job. A later warning, TERM or repeated cancel reuses that success.
+### Lifecycle
 
-A failed step query, a step still alive after 60 seconds, or a failed transfer
-leaves copy-back pending. The utility keeps the job tracked for retry with
-`slurm-utils cancel`; the batch shell also retries on TERM. Cancelling a pending
-job skips the transfer. A hook receives `SCRATCH_SYNC_REASON` (`warning`, `exit`
-or `cancel`) and can read metadata its staging hook saved in job scratch.
+- **Stage-in** runs once at batch start. `connect` and `jupyter` become available only after it succeeds. You can connect from other checkouts on the same allocation, but only the checkout that requested migration is copied.
+- **Warning:** migrated jobs use `--signal=B:USR1@300` and are never requeued onto another node. About five minutes before the time limit, or on `slurm-utils cancel`, the allocation starts draining: no new shells, Jupyter servers, setup steps or tmux panes; running workload steps (including those from other checkouts) get SIGTERM.
+- **Copy-back:** once those steps exit, `bin/sync-scratch` runs on the node. A `cancel` during the warning waits for the same transfer. The hook sees `SCRATCH_SYNC_REASON` (`warning`, `exit` or `cancel`) and can read any metadata your stage-in saved in scratch.
+- **Failures:** if the step query fails, a step is still alive after 60 s, or the transfer fails, copy-back stays pending and the job stays tracked. Retry with `slurm-utils cancel` (the batch shell also retries on TERM). Cancelling a *pending* job skips the transfer.
 
-The drain covers processes supervised by Slurm workload steps. Keep writers
-inside these steps and avoid starting raw `srun` or SSH workloads during drain.
-The job's `SLURM_UTILS_DRAIN_FILE` path is exported to stage-in and managed steps.
-Its presence tells cooperating processes to stop launching work. Size checkpoint
-flushes and transfers for the time available. A hard deadline or node loss can
-interrupt a transfer.
+Caveats:
 
-### Choose a GPU by video memory
+- Draining only covers processes supervised by Slurm steps. Keep writers inside those steps and avoid raw `srun` or SSH workloads during the drain.
+- `SLURM_UTILS_DRAIN_FILE` is exported to stage-in and managed steps. If that file exists, cooperating processes should stop launching work.
+- A hard deadline or node loss can still interrupt a transfer. Size your checkpoint flushes for the time you have.
 
-```bash
-slurm-utils schedule --vmem 30
-# Also accepts 30G or 30GB; all mean at least 30 GB per GPU.
-```
+## Project setup
 
-`--vmem` is optional and only valid with `schedule`. It queries `sinfo` for the
-GPU types advertised in the configured `PARTITION` (or Slurm's default view
-when `PARTITION` is empty), removes duplicates, and filters by nominal VRAM.
-It overrides the GPU type in `GRES`, preserving the count. `GRES` must be empty
-(defaulting to one GPU) or one `gpu[:type]:count` request. Without `--vmem`,
-scheduling continues to use `GRES` as configured.
-
-Slurm does not expose a portable GPU VRAM inventory field. Capacity is resolved
-from explicit type suffixes such as `a100_80gb` and MIG `h200_3g.71gb`, then an
-exact model table: A40/L40/L40S/RTX A6000/RTX 6000 Ada (48 GB), H200 (141 GB),
-and RTX PRO 6000 Blackwell server/workstation editions (96 GB). These are
-nominal model/profile capacities, not measurements of currently free CUDA
-memory. Unknown types are skipped with a message, rather than guessed from
-the parent GPU name. Add or override site-specific names in trusted config:
-
-```bash
-declare -A GPU_MEMORY_GB=(
-  [site_specific_gpu]=48
-  [site_mig_profile]=40
-)
-```
-
-The command lists all qualifying types and capacities, runs
-[`sbatch --test-only`](https://slurm.schedmd.com/sbatch.html#OPT_test-only)
-for each using the same CPU, RAM, partition, and time requirements as the final
-request, and prints each estimated start time in UTC. Estimates that fail or
-contain no start time are reported and skipped. It prints the chosen type and
-expected start, then submits **one** job for the earliest estimate; ties use
-alphabetical GPU type order. For example:
-
-```text
-Considering GPUs with at least 30 GB VRAM per GPU (count 1):
-  gpu:a40:1 (48 GB per GPU)
-  gpu:h200_3g.71gb:1 (71 GB per GPU)
-  gpu:a40:1: estimated start 2026-11-07T18:34:45 UTC
-  gpu:h200_3g.71gb:1: estimated start 2026-11-07T14:08:46 UTC
-Chosen GPU: gpu:h200_3g.71gb:1 (71 GB per GPU); expected start 2026-11-07T14:08:46 UTC.
-Start time is an estimate; the submitted GPU type remains fixed while queued.
-Scheduled allocation 123
-```
-
-No qualifying types, a failed inventory query, or no usable scheduling estimates
-causes a failure without submitting a job or replacing the current allocation
-pointer. A pending job retains its chosen type; it does not switch types as
-queue conditions change. Slurm's estimates can change between checking and
-submission, and cluster policy still determines access and actual start times.
-The chosen typed `GRES` is saved for inspection in the allocation settings.
-`--mem` and `--mem-per-gpu` concern host RAM and do not set this VRAM minimum.
-
-`status` reports the ID, queue state, assigned node, scratch path when known,
-and stdout/stderr paths. `FINISHED` means the job is no longer in the queue;
-it does not assert successful completion. Consult logs or your cluster's
-`sacct` command for the final outcome. For pending jobs, Slurm may display a
-node placeholder. Before scratch metadata arrives, attachment reports
-“initializing; retry shortly.” Check the batch logs if initialization fails.
-
-`connect` opens `zsh --login` in an interactive `srun` step, falling back to
-`bash --login` with a message if zsh is unavailable. It starts in the same
-directory from which you ran `connect`; that path must exist on the compute
-node. An unavailable directory fails rather than silently starting elsewhere.
-
-If `tmux` is installed on the login node, `connect` creates a session there
-for the current checkout on that allocation and attaches to it. The first window and every new tmux
-window (`Ctrl-b c`) or split pane (`Ctrl-b %` or `Ctrl-b "`) start a separate
-interactive `srun` step on the compute node. New shells use the directory from
-the first `connect`. Detach with `Ctrl-b d`; run `slurm-utils connect` on the
-same login node from the same checkout to reattach. From an existing login-node tmux client, `connect`
-switches to the allocation session. Other tmux sessions keep their settings.
-Without tmux, `connect` opens the compute shell directly.
-
-These shortcuts create tmux windows/panes. A new tab in your terminal app or
-VS Code still starts on its configured host; run `slurm-utils connect` there
-to attach. Keeping tmux on the login node does not extend the Slurm time limit.
-
-`jupyter` opens a
-foreground step and runs `jupyter notebook --no-browser --ip=0.0.0.0` with the
-configured port (or the optional `jupyter PORT` argument) and zero port retries.
-Port arguments must be integers from 1 to 65535 and do not change saved settings.
-Jupyter starts in the directory from which you ran the command.
-Both export `SCRATCH_DIR` and use
-[`srun --overlap`](https://slurm.schedmd.com/srun.html) to share the reservation's
-resources. Exiting a shell or stopping Jupyter leaves the allocation running.
-
-Each Jupyter launch generates a fresh 256-bit random token, passes it through
-`JUPYTER_TOKEN`, and prints a compute-node URL. In VS Code connected to the
-login node through Remote SSH, select an existing Jupyter server and paste
-that URL once Jupyter reports that it is ready. Treat the URL as a credential.
-Direct access assumes that the login node can resolve the compute hostname
-and reach its port. The server listens on all compute-node interfaces and
-uses HTTP; use it only within an appropriate trusted cluster network. See
-[Jupyter's remote-server documentation](https://jupyter-server.readthedocs.io/en/latest/operators/public-server.html).
-No SSH tunnel is created. A port conflict fails instead of silently selecting
-a different port. Normal Jupyter output and errors remain in your terminal.
-
-`cancel` calls `scancel` and clears the current pointer only after Slurm accepts
-cancellation. Failure preserves the pointer so you can retry. Cancellation
-ends the allocation and its steps; it may take Slurm a short time to finish.
-
-## Interactive project setup
-
-From your project directory on the login node, with a running, initialized
-allocation:
+From your project directory on the login node, with a running and initialized allocation:
 
 ```bash
 slurm-utils set-up
 slurm-utils connect
 ```
 
-`set-up` connects to that allocation in the current directory, prints each
-command, and requires an explicit `y` or `yes` before running it. Empty input,
-EOF, and other answers decline. It asks before connecting, creating `.venv`,
-installing direnv, changing your login shell, appending each configuration
-line, and trusting `.envrc`. Declining a required step stops setup; declining
-`chsh` offers the same fallback as a failed shell change. Earlier completed
-steps are retained, so you can rerun setup.
+`set-up` connects to the allocation in your current directory and prints every command before running it. Each step needs an explicit `y` or `yes`; empty input, EOF, or anything else declines. Declining a required step stops setup. Completed steps are kept, so you can rerun it. It asks before:
 
-Setup uses the allocation's private `SCRATCH_DIR` as `TMPDIR` for temporary
-files during setup and package installation, avoiding a full system `/tmp`.
-It creates `.venv` with `python3 -m venv --without-pip .venv`, then separately
-asks to run `.venv/bin/python -m ensurepip --upgrade --default-pip`. Running
-ensurepip directly displays the underlying error if pip bootstrapping fails;
-check Python ensurepip support and available space in the printed temporary
-directory before retrying.
+1. **Creating `.venv`** with `python3 -m venv --without-pip`, then separately bootstrapping pip with `ensurepip`. A working existing environment is reused, and nothing is ever deleted. An interrupted venv with a valid `pyvenv.cfg` and working Python is offered a repair. Other broken `.venv` directories stop setup for manual repair.
+2. **Installing direnv** from the [official installer](https://direnv.net/docs/installation.html) into the directory containing `slurm-utils` (must be writable and shared). An existing working direnv there is reused. No sudo or system packages.
+3. **Changing your login shell** to zsh with `chsh`. If that's unavailable or rejected, it offers to add `export SHELL=/path/to/zsh` to `.envrc` instead. `connect` launches zsh directly either way.
+4. **Editing config files:** appends `.venv` activation and a `PATH` entry to `.envrc`, and the [direnv hooks](https://direnv.net/docs/hook.html) to `${ZDOTDIR:-$HOME}/.zshrc` and `~/.bashrc`. Existing contents are preserved and lines aren't duplicated.
+5. **Running `direnv allow .`** after showing you the whole `.envrc`, since allowing it also trusts any commands already in it.
+6. **Installing Jupyter** (`notebook` and `ipykernel`) into `.venv`, then optionally **registering a kernel** named `Python (.venv: /path/to/project)` for Jupyter and the [VS Code Jupyter extension](https://code.visualstudio.com/docs/datascience/jupyter-notebooks). Declining either still completes setup. Reruns update the same kernel; different projects get different names.
 
-A working existing environment is reused; missing pip is bootstrapped with
-confirmation, including when retrying a failed or declined bootstrap. If a previous venv attempt left a
-valid `pyvenv.cfg` and working environment Python but no activation script,
-setup offers to finish creating the environment with its own interpreter,
-then bootstrap pip. Existing packages are preserved; nothing is deleted.
-Other incomplete or unusable `.venv` directories stop setup for manual repair.
-If Python, its venv support, or zsh is unavailable, load the appropriate cluster
-module or ask your administrator, then retry.
+Temporary files go to the allocation's `SCRATCH_DIR` (as `TMPDIR`), so a full `/tmp` doesn't break installs. If Python, `venv` support, or zsh is missing, load the right cluster module or ask your admin, then retry. If pip bootstrapping or package installs fail, check the error shown, free space in the printed temp directory, and package-index access.
 
-At the end, setup asks whether to install Jupyter Notebook and ipykernel with
-`.venv/bin/python -m pip install notebook ipykernel`. These provide the notebook
-server and Python kernel for the [VS Code Jupyter extension](https://code.visualstudio.com/docs/datascience/jupyter-notebooks).
-Declining skips installation and registration and still completes setup.
-Installation errors stop setup with a message; rerun it after fixing the
-environment or package-index access.
+After setup, the next `connect` starts a fresh shell that loads the project environment. For Bash login sessions outside `connect`, make sure your login file sources `~/.bashrc`.
 
-After installation, a separate confirmation asks to register the environment
-using its absolute Python path and `-m ipykernel install --user`. The
-[registered kernel](https://ipython.readthedocs.io/en/stable/install/kernel_install.html)
-appears as `Python (.venv: /path/to/project)` in Jupyter and VS Code. Its internal
-name is derived from the project's absolute path, so reruns update the same
-kernel and different projects have different names. Declining registration
-leaves installed packages in place. Run `slurm-utils jupyter` from the project
-directory to launch its server, then select this kernel in VS Code.
+## State, logs, and scratch
 
-It downloads the [official direnv installer](https://direnv.net/docs/installation.html)
-and runs it with `bin_path` set to the directory containing the resolved
-`slurm-utils` executable. That directory must be writable and shared. A
-working direnv already in that directory is reused. Failed or empty downloads
-stop setup before the installer runs; installation failures are reported and
-can be retried. There is no sudo or system package installation.
+- **State** lives in `${XDG_STATE_HOME:-$HOME/.local/state}/slurm-utils` with private permissions. Set `XDG_STATE_HOME` to an absolute shared path if the default doesn't suit you. Don't edit state files while the tool is running. Use one Slurm cluster per state directory.
+- **Settings snapshot:** each `schedule` saves its settings and batch script in its own launch directory, and later commands use that snapshot even if you change or delete the config. The exception is the contents of an external `ENV_SETUP` file, so keep it in place.
+- **Logs** go to `LOG_DIR/slurm-utils-JOBID.out` and `.err`. Launch directories and logs are kept after cancellation; delete them yourself when no longer needed. A rejected submission keeps its launch directory for inspection.
+- **Malformed `sbatch` output:** check `squeue` before retrying. The job may have been submitted even though the tool couldn't record its ID.
+- **Scratch:** on the compute node, the first usable root in `SCRATCH_ROOTS` gets a private `<root>/<user>/<job-id>` directory. If none is usable, the batch job fails with a clear error. Scratch is usually local to the compute node, not visible from the login node. **slurm-utils never deletes scratch data**, but your cluster's cleanup policy might, so copy anything valuable out (or use `--migrate-scratch`) before the allocation ends.
 
-Setup tries `chsh -s /path/to/zsh`. When unavailable, declined, or rejected by
-cluster policy, it offers to append `export SHELL=/path/to/zsh` to `.envrc`.
-This sets the project's preferred shell; `connect` launches zsh directly even
-when the account's login shell could not be changed. Direnv evaluates `.envrc`
-in a subprocess, so this fallback does not replace an already running shell.
+## Uninstall
 
-Setup appends activation of `.venv` and adds the binary directory to `PATH`
-in `.envrc`. It adds the [direnv shell hooks](https://direnv.net/docs/hook.html)
-to `${ZDOTDIR:-$HOME}/.zshrc` and `~/.bashrc`, using the installed binary's
-absolute path. Existing file contents are preserved and matching lines are
-not appended twice. The entire `.envrc` is displayed before asking to run
-`direnv allow .`, because allowing it trusts any existing commands too.
-Setup then returns to the login node; the next `connect` starts a fresh shell
-and loads the project environment. For Bash login sessions outside `connect`,
-ensure your login startup file sources `~/.bashrc` to activate its hook.
+Cancel the allocation first (`slurm-utils cancel`, or `scancel JOBID`). Then remove `~/.local/bin/slurm-utils` and, if you no longer need them, `~/.config/slurm-utils` and the state directory. Logs and scratch data stay behind and need manual cleanup.
 
-## State, logs, and scratch lifetime
+## Scope
 
-State lives under `${XDG_STATE_HOME:-$HOME/.local/state}/slurm-utils` with private
-permissions. Schedule/cancel operations use `flock`; state and scratch metadata
-are replaced atomically. Set `XDG_STATE_HOME` to an absolute shared path if the
-default is unsuitable. Do not edit state files while the utility is running.
+slurm-utils does not do multi-cluster management, adopting arbitrary jobs, named allocations, automatic SSH tunnels, background Jupyter supervision, or general job submission.
 
-Each submission saves the launch settings and batch script in its own launch
-directory. Later commands use this snapshot, even if configuration changes or
-is removed. The contents of an external `ENV_SETUP` file are not snapshotted;
-keep that file available. Logs go to `LOG_DIR/slurm-utils-JOBID.out` and `.err`.
-A rejected submission retains its launch directory for inspection. If `sbatch`
-returns malformed output, inspect `squeue` before retrying: submission may
-have succeeded even though the utility could not record its ID.
+## Tests
 
-On the compute node, the first usable configured scratch root gets a private
-`<root>/<user>/<job-id>` directory. No usable root causes a clear batch error.
-Scratch metadata is job-specific and written to shared state. Scratch is
-usually local to that compute node, not the login node. The utility **never
-deletes scratch data**. Use the migration hooks or copy valuable output
-elsewhere before ending the allocation; cluster cleanup policy may remove scratch independently.
-
-Launch directories and logs are retained after cancellation for inspection.
-Remove obsolete files manually when no job needs them. The scope excludes
-multi-cluster management, arbitrary job adoption, named allocations, automatic
-tunnels, background Jupyter supervision, and general workload submission.
-
-## Upgrade and uninstall
-
-To upgrade, rerun the curl command above or repeat the executable installation
-command. Keep your edited configuration; compare it with the new example
-rather than overwriting it.
-Existing reservations run their saved batch scripts.
-
-Before uninstalling, cancel the allocation (or use `scancel JOBID` if needed).
-Remove `~/.local/bin/slurm-utils` and, if no longer needed,
-`~/.config/slurm-utils` and the state directory. Logs and scratch data remain
-and must be handled separately.
-
-## Validation
+Tests use temporary directories and fake Slurm and Jupyter commands, so no cluster is needed. [ShellCheck](https://www.shellcheck.net/) is a dev-only dependency.
 
 ```bash
-bash -n slurm-utils install.sh config.example.sh tests/test.sh tests/tmux.sh tests/vmem.sh tests/migration.sh
-shellcheck slurm-utils install.sh config.example.sh tests/test.sh tests/tmux.sh tests/vmem.sh tests/migration.sh
+shellcheck slurm-utils install.sh config.example.sh tests/*.sh
 bash tests/test.sh
 bash tests/vmem.sh
 bash tests/migration.sh
-# With tmux installed (uses an isolated temporary tmux server):
-bash tests/tmux.sh
+bash tests/tmux.sh    # needs tmux; uses an isolated temporary server
 ```
 
-Tests use temporary directories and fake Slurm/Jupyter commands. They cover
-missing/invalid configuration, quoted paths, duplicate submission, pending,
-running and finished jobs, scheduler failures, scratch selection/failure,
-cancellation failure, settings persistence, environment setup, step options,
-Jupyter arguments and fresh tokens, connection directories and shell fallback,
-and setup confirmations, reruns, preservation of existing files, and failure
-paths for venv, direnv, and login-shell changes. No cluster or Jupyter installation is
-needed. Tests also cover optional package installation and registration,
-missing pip, package/kernel failures, project environment selection, and port
-overrides and validation. ShellCheck is a development-only dependency.
-VRAM tests cover discovery, MIG sizes, unknown types and overrides, printed
-estimates, earliest selection and ties, GPU counts, saved selection, CLI
-validation, scheduler failures, and the single-submission guarantee.
-The tmux integration test checks new windows and split panes, reattachment,
-session recreation, quoted paths, and preservation of unrelated sessions.
+Mocks can't prove cluster compatibility, network reachability, Kerberos behavior, GPU visibility, or site-specific Slurm policy. Before relying on it, try it end to end on your cluster with a small GPU allocation:
 
-Before relying on a real cluster:
-
-1. Configure a small allocation with a GPU and run `schedule`, then `status`
-   until running and initialized. Check both log paths.
-2. Run `connect`, verify `hostname`, `nvidia-smi`, and write a test file in
-   `$SCRATCH_DIR`. If tmux is available, create a window and split pane and
-   verify they also run on the compute node. Detach and run `connect` again
-   to verify reattachment. Exit and confirm the reservation remains running.
-3. Run `jupyter`, connect VS Code Remote SSH using the printed URL, and execute
-   a notebook cell checking the hostname and GPU visibility in the intended
-   environment. Confirm a second launch on the same port fails.
-4. Stop Jupyter with Ctrl-C, confirm `status` is still running, and reconnect
-   to the shell. Launch Jupyter again and confirm the token changes.
-5. Run `cancel` from another login terminal. Confirm the reservation and all
-   steps disappear from Slurm, the current pointer is cleared, and scratch
-   was not deleted by the utility.
-6. In a disposable shared project directory with a new allocation, run
-   `set-up`. Review each displayed command. Check the resulting `.venv`,
-   `.envrc`, shell hooks, and direnv next to `slurm-utils`. Connect and verify
-   `pwd`, `echo "$SHELL"`, and `python -c 'import sys; print(sys.prefix)'`.
-   If `chsh` is denied, verify the project-local fallback still selects zsh.
-
-Mocks cannot establish cluster compatibility, network reachability, Kerberos
-behavior, GPU visibility, or site-specific Slurm policy.
+1. `schedule`, then `status` until running; check both log files.
+2. `connect`; verify `hostname`, `nvidia-smi`, and that you can write to `$SCRATCH_DIR`. With tmux, check that new windows and panes also land on the compute node and that detach/reattach works.
+3. `jupyter`; connect VS Code with the printed URL and run a cell that checks hostname and GPU visibility. Confirm a second launch on the same port fails, and that the token changes between launches.
+4. Ctrl-C Jupyter and confirm `status` still shows the job running.
+5. `cancel` from another terminal; confirm the job and all steps are gone from the queue and scratch wasn't deleted.
+6. In a disposable shared directory, run `set-up` and review each command it shows.
