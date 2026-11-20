@@ -52,7 +52,9 @@ copy_back() {
     flock -x 7
     [[ ! -f $LAUNCH_DIR/copied ]] || return 0
     touch "$LAUNCH_DIR/draining"
-    stop_workloads "$SLURM_JOB_ID"
+    local helper_step=''
+    if [[ $1 = cancel ]]; then helper_step=${SLURM_STEP_ID:?Missing copy-back step ID}; fi
+    stop_workloads "$SLURM_JOB_ID" "$helper_step"
     IFS= read -r SCRATCH_DIR < "$LAUNCH_DIR/scratch-$SLURM_JOB_ID"
     export PROJECT_DIR SCRATCH_DIR SCRATCH_SYNC_REASON=$1
     cd -- "$PROJECT_DIR"
@@ -71,7 +73,7 @@ stop_workloads() {
             # Numeric workload steps only. Exclude batch/extern, which keep the
             # reservation and credentials alive, and never target another job.
             [[ $step = "$job."* && ${step#*.} =~ ^[0-9]+$ ]] || continue
-            [[ $step != "$job.${SLURM_STEP_ID:-batch}" ]] || continue
+            [[ $step != "$job.$2" ]] || continue
             active=1
             if [[ ! ${signalled[$step]+x} ]]; then
                 # Finishing between squeue and scancel is harmless. A surviving

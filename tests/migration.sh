@@ -45,7 +45,7 @@ cat > "$work/bin/squeue" <<'MOCK'
 if [[ $1 = --steps ]]; then
     [[ $2 = --jobs=42 && ! -e $MOCK/step-query-fail ]] || exit 1
     printf '%s\n' 42.batch 42.extern 99.1
-    if [[ -n ${SLURM_STEP_ID:-} ]]; then echo "42.$SLURM_STEP_ID"; fi
+    if [[ ${MOCK_HELPER:-} = yes ]]; then echo "42.$SLURM_STEP_ID"; fi
     if [[ -e $MOCK/step ]]; then echo 42.3; fi
 else
     [[ -e $MOCK/finished ]] || echo '42|RUNNING|node'
@@ -70,7 +70,7 @@ while [[ $1 != bash && $1 != env ]]; do
     case $1 in --chdir=*) cd -- "${1#--chdir=}" ;; esac
     shift
 done
-export SLURM_JOB_ID=42 SLURM_STEP_ID=12
+export SLURM_JOB_ID=42 SLURM_STEP_ID=12 MOCK_HELPER=yes
 exec "$@"
 MOCK
 cat > "$work/bin/zsh" <<'MOCK'
@@ -121,7 +121,7 @@ schedule() {
     batch=$(tail -1 "$work/submission")
     launch=${batch%/*}
 }
-start() { SLURM_JOB_ID=42 bash "$batch" > "$work/log" 2>&1 & batch_pid=$!; }
+start() { SLURM_JOB_ID=42 SLURM_STEP_ID=3 bash "$batch" > "$work/log" 2>&1 & batch_pid=$!; }
 stop() { kill -TERM "$batch_pid"; wait "$batch_pid"; batch_pid=''; }
 await() {
     local i
@@ -238,7 +238,7 @@ grep -Fxq "$b/nested" "$work/connected"
 touch "$work/block-sync"
 kill -USR1 "$batch_pid"
 await grep -qx sync "$work/events"
-SLURM_JOB_ID=42 bash "$launch/copy-back.sh" cancel & duplicate=$!
+SLURM_JOB_ID=42 SLURM_STEP_ID=12 bash "$launch/copy-back.sh" cancel & duplicate=$!
 rm "$work/block-sync"
 wait "$duplicate"
 await test -f "$launch/copied"
