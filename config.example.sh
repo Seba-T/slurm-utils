@@ -24,3 +24,7 @@ JUPYTER_PORT=1234
 # Optional site-specific nominal VRAM capacities for schedule --vmem GB.
 # Unknown GPU types are skipped unless named here (keys must match sinfo %G).
 # declare -A GPU_MEMORY_GB=([site_specific_gpu]=48 [site_mig_profile]=40)
+
+# Optional activation scripts, keyed by the physical checkout root. These are
+# for environment variables and modules. Put data copies in the migration hooks.
+# declare -A PROJECT_ENVS=(["$HOME/my-project"]="$HOME/my-project/config-env.sh")

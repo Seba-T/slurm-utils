@@ -6,7 +6,7 @@ fail() { printf 'slurm-utils: %s\n' "$*" >&2; exit 1; }
 help() {
     cat <<'HELP'
 Usage: slurm-utils [--config PATH] schedule|status|connect|set-up|jupyter|cancel
-       slurm-utils [--config PATH] schedule [--vmem GB]
+       slurm-utils [--config PATH] schedule [--vmem GB] [--migrate-scratch]
        slurm-utils [--config PATH] jupyter [PORT]
 
 Track one Slurm allocation. Configuration defaults to
@@ -17,10 +17,14 @@ prints scheduling estimates, and submits one request for the earliest type.
 The chosen type remains fixed while queued. This overrides the type in GRES.
 connect preserves your current directory and prefers zsh (falls back to Bash).
 When available, login-node tmux keeps the connection alive; new windows and
-panes connect to the same allocation. Run connect again to reattach.
+panes connect to the same allocation. Run connect in the same checkout to reattach.
 set-up prepares .venv, direnv, and zsh in this directory inside a running job,
 asking for confirmation before each change. Jupyter defaults to port 1234.
 set-up can optionally install Notebook/ipykernel and register the .venv kernel.
+Jupyter prefers .venv in the current directory or checkout. ENV_SETUP is for
+shared environments outside Git. Keep data transfers out of login/direnv hooks.
+schedule --migrate-scratch runs bin/stage-scratch from this project at job start
+and bin/sync-scratch before timeout or cancellation. Both must be executable.
 HELP
 }
 
@@ -32,8 +36,81 @@ validate_port() {
 
 # These functions are copied into the submitted script; no installed executable
 # is required on the compute node.
+# Publish only after staging succeeds: connect, set-up and Jupyter all use this
+# file as the readiness signal. The caller holds migration.lock for opted-in jobs.
+publish_scratch() {
+    local temp
+    temp=$(mktemp "$LAUNCH_DIR/.scratch.XXXXXX")
+    printf '%s\n' "$SCRATCH_DIR" > "$temp"
+    mv -- "$temp" "$LAUNCH_DIR/scratch-$SLURM_JOB_ID"
+}
+
+# The generated on-node copy-back script owns this lock and success marker.
+# This also protects direct retries after a client disconnects during srun.
+copy_back() {
+    exec 7> "$LAUNCH_DIR/copy-back.lock"
+    flock -x 7
+    [[ ! -f $LAUNCH_DIR/copied ]] || return 0
+    touch "$LAUNCH_DIR/draining"
+    stop_workloads "$SLURM_JOB_ID"
+    IFS= read -r SCRATCH_DIR < "$LAUNCH_DIR/scratch-$SLURM_JOB_ID"
+    export PROJECT_DIR SCRATCH_DIR SCRATCH_SYNC_REASON=$1
+    cd -- "$PROJECT_DIR"
+    ./bin/sync-scratch
+    touch "$LAUNCH_DIR/copied"
+}
+
+stop_workloads() {
+    local job=$1 listing step
+    local deadline=$((SECONDS + 60))
+    local -A signalled=()
+    while :; do
+        listing=$(squeue --steps --jobs="$job" --noheader --format='%i') || return 1
+        local active=0
+        while IFS= read -r step; do
+            # Numeric workload steps only. Exclude batch/extern, which keep the
+            # reservation and credentials alive, and never target another job.
+            [[ $step = "$job."* && ${step#*.} =~ ^[0-9]+$ ]] || continue
+            [[ $step != "$job.${SLURM_STEP_ID:-batch}" ]] || continue
+            active=1
+            if [[ ! ${signalled[$step]+x} ]]; then
+                # Finishing between squeue and scancel is harmless. A surviving
+                # step must disappear from a subsequent successful query.
+                if scancel --signal=TERM "$step"; then signalled[$step]=1; fi
+            fi
+        done <<< "$listing"
+        ((active)) || return 0
+        if ((SECONDS >= deadline)); then
+            echo "Workload steps in allocation $job are still active after SIGTERM; scratch sync deferred" >&2
+            return 1
+        fi
+        sleep 1
+    done
+}
+
+# Startup, warning and cancel are serialized with migration.lock. The cancel
+# helper is the only workload step excluded from its own drain.
+drain_and_sync() {
+    local job=$1 reason=$2
+    [[ ! -f $LAUNCH_DIR/copied ]] || return 0
+    if [[ $reason = cancel ]]; then
+        srun --jobid "$job" --overlap --nodes=1 --ntasks=1 --export=ALL \
+            bash "$LAUNCH_DIR/copy-back.sh" "$reason"
+    else
+        bash "$LAUNCH_DIR/copy-back.sh" "$reason"
+    fi
+}
+
+sync_before_timeout() (
+    flock -x 8 || exit 1
+    [[ ! -f $LAUNCH_DIR/cancelled ]] || exit 0
+    drain_and_sync "$SLURM_JOB_ID" "$1"
+) 8> "$LAUNCH_DIR/migration.lock"
+
 batch_main() {
-    local root scratch='' temp renewal='' sleeper=''
+    local root scratch='' renewal='' sleeper='' warning=0
+    # Slurm can deliver its warning while startup or a long stage-in is running.
+    if [[ -n $PROJECT_DIR ]]; then trap 'warning=1' USR1; fi
     for root in "${SCRATCH_ROOTS[@]}"; do
         if [[ -d $root && -w $root ]] &&
             mkdir -p -- "$root/$LAUNCH_USER/$SLURM_JOB_ID"; then
@@ -44,11 +121,8 @@ batch_main() {
     done
     [[ -n $scratch ]] || { echo 'No usable configured scratch root' >&2; exit 1; }
     export SCRATCH_DIR=$scratch
-    temp=$(mktemp "$LAUNCH_DIR/.scratch.XXXXXX")
-    printf '%s\n' "$scratch" > "$temp"
-    mv -- "$temp" "$LAUNCH_DIR/scratch-$SLURM_JOB_ID"
     # Invoked by the EXIT trap in the generated batch script.
-    # shellcheck disable=SC2329
+    # shellcheck disable=SC2317,SC2329
     cleanup() {
         [[ -z $renewal ]] || kill "$renewal" 2>/dev/null || true
         [[ -z $sleeper ]] || kill "$sleeper" 2>/dev/null || true
@@ -65,11 +139,38 @@ batch_main() {
             renewal=''
         fi
     fi
-    while :; do sleep 3600 & sleeper=$!; wait "$sleeper"; done
+    if [[ -n $PROJECT_DIR ]]; then
+        export PROJECT_DIR SLURM_UTILS_DRAIN_FILE="$LAUNCH_DIR/draining"
+        (
+            flock -x 8
+            [[ ! -f $LAUNCH_DIR/cancelled ]] || exit 0
+            cd -- "$PROJECT_DIR"
+            ./bin/stage-scratch 8>&-
+            publish_scratch
+        ) 8> "$LAUNCH_DIR/migration.lock"
+        [[ -f $LAUNCH_DIR/scratch-$SLURM_JOB_ID ]] || exit 0
+        # Retry a failed warning at exit. Successful copy-back is recorded.
+        trap 'sync_before_timeout exit || { echo "Final scratch sync failed" >&2; exit 1; }; exit 0' TERM INT
+        trap 'sync_before_timeout warning || echo "Early scratch sync failed; will retry on exit" >&2' USR1
+        if ((warning)); then sync_before_timeout warning || echo "Early scratch sync failed; will retry on exit" >&2; fi
+    else
+        publish_scratch
+    fi
+    while :; do
+        sleep 3600 & sleeper=$!
+        # A trapped warning interrupts wait, but the sleeper is still running.
+        while kill -0 "$sleeper" 2>/dev/null; do wait "$sleeper" || true; done
+    done
+}
+
+checkout_root() {
+    git -C "$1" rev-parse --show-toplevel 2>/dev/null
 }
 
 connect_tmux() {
-    local session="slurm-utils-$JOB_ID-${LAUNCH_DIR##*.}"
+    local session project_key
+    project_key=$(printf '%s' "$project_dir" | sha256sum)
+    session="slurm-utils-$JOB_ID-${LAUNCH_DIR##*.}-${project_key:0:16}"
     local launcher bash_path default_command
     bash_path=$(command -v bash)
     # Serialize creation, but never leave the lock open in the tmux server.
@@ -245,10 +346,12 @@ caller_dir=$(pwd -P)
 command_name=''
 port_override=''
 vmem_gb=''
+migrate_scratch=0
 while (($#)); do
     case $1 in
         --help|-h) help; exit 0 ;;
         --config) (($# >= 2)) || fail '--config needs a path'; config=$2; shift 2 ;;
+        --migrate-scratch) migrate_scratch=1; shift ;;
         --vmem)
             (($# >= 2)) || fail '--vmem needs a positive integer in GB, e.g. --vmem 30'
             [[ -z $vmem_gb ]] || fail 'Specify --vmem only once'
@@ -271,6 +374,7 @@ while (($#)); do
 done
 [[ -n $command_name ]] || { help; exit 1; }
 [[ -z $vmem_gb || $command_name = schedule ]] || fail '--vmem is only supported by schedule'
+((!migrate_scratch)) || [[ $command_name = schedule ]] || fail '--migrate-scratch is only supported by schedule'
 state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/slurm-utils"
 [[ $state_dir = /* ]] || fail 'State directory must be absolute'
 mkdir -p -- "$state_dir"
@@ -282,8 +386,14 @@ load_current() {
     # shellcheck disable=SC1091
     source "$state_dir/current"
     [[ $JOB_ID =~ ^[0-9]+$ && $LAUNCH_DIR = "$state_dir/"* ]] || fail 'Invalid saved state'
+    # Snapshots from before --migrate-scratch never opted in.
+    PROJECT_DIR=''
+    local -A PROJECT_ENVS=()
     # shellcheck disable=SC1091
     source "$LAUNCH_DIR/settings.sh"
+    if [[ $command_name = jupyter ]]; then
+        project_env=${PROJECT_ENVS[$project_dir]:-}
+    fi
 }
 query() {
     local output id state node
@@ -329,6 +439,14 @@ validate_config() {
         [[ $root = /* && $root != *$'\n'* ]] || fail 'Scratch roots must be absolute single-line paths'
     done
     KEYTAB=${KEYTAB:-}
+    if declare -p PROJECT_ENVS >/dev/null 2>&1; then
+        declaration=$(declare -p PROJECT_ENVS)
+        [[ $declaration = 'declare -A '* ]] || fail 'PROJECT_ENVS must map checkout roots to environment setup files'
+        for root in "${!PROJECT_ENVS[@]}"; do
+            [[ $root = /* && ${PROJECT_ENVS[$root]} = /* && -f ${PROJECT_ENVS[$root]} && -r ${PROJECT_ENVS[$root]} ]] ||
+                fail 'PROJECT_ENVS requires an absolute checkout path and an absolute readable file'
+        done
+    fi
     ENV_SETUP=${ENV_SETUP:-}
     [[ -z $KEYTAB || $KEYTAB = /* ]] || fail 'KEYTAB must be absolute'
     [[ -z $ENV_SETUP || ( $ENV_SETUP = /* && -r $ENV_SETUP ) ]] || fail 'ENV_SETUP must be an absolute readable file'
@@ -430,27 +548,49 @@ case $command_name in
             finished || fail "Allocation $JOB_ID is still $JOB_STATE"
         fi
         # Clear previous settings and inherited configuration values.
-        unset GPU_MEMORY_GB JOB_NAME PARTITION GRES CPUS_PER_TASK MEMORY TIME_LIMIT LOG_DIR SCRATCH_ROOTS KEYTAB ENV_SETUP JUPYTER_PORT
+        unset GPU_MEMORY_GB JOB_NAME PARTITION GRES CPUS_PER_TASK MEMORY TIME_LIMIT LOG_DIR SCRATCH_ROOTS KEYTAB ENV_SETUP JUPYTER_PORT PROJECT_ENVS
         [[ -r $config ]] || fail "Missing configuration: $config; copy config.example.sh there and edit it"
         # shellcheck disable=SC1090
         source "$config"
         validate_config
+        PROJECT_DIR=''
+        if ((migrate_scratch)); then
+            command -v git >/dev/null || fail 'Git is required to identify the migration project'
+            PROJECT_DIR=$(checkout_root "$caller_dir") || PROJECT_DIR=$caller_dir
+            for hook in bin/stage-scratch bin/sync-scratch; do
+                [[ -f $PROJECT_DIR/$hook && -x $PROJECT_DIR/$hook ]] ||
+                    fail "--migrate-scratch needs an executable $PROJECT_DIR/$hook"
+            done
+        fi
         LAUNCH_DIR=$(mktemp -d "$state_dir/launch.XXXXXXXX")
         LAUNCH_USER=$(id -un)
         {
-            for name in JOB_NAME PARTITION GRES CPUS_PER_TASK MEMORY TIME_LIMIT LOG_DIR KEYTAB ENV_SETUP JUPYTER_PORT LAUNCH_USER; do
+            for name in JOB_NAME PARTITION GRES CPUS_PER_TASK MEMORY TIME_LIMIT LOG_DIR KEYTAB ENV_SETUP JUPYTER_PORT LAUNCH_USER PROJECT_DIR; do
                 printf '%s=%q\n' "$name" "${!name}"
             done
+            if declare -p PROJECT_ENVS >/dev/null 2>&1; then
+                declare -p PROJECT_ENVS
+            fi
             printf 'SCRATCH_ROOTS=('
             printf ' %q' "${SCRATCH_ROOTS[@]}"
             printf ' )\n'
         } > "$LAUNCH_DIR/settings.sh"
+        if ((migrate_scratch)); then
+            {
+                printf '#!/usr/bin/env bash\nset -euo pipefail\numask 077\nLAUNCH_DIR=%q\n' "$LAUNCH_DIR"
+                # shellcheck disable=SC2016
+                printf 'source "$LAUNCH_DIR/settings.sh"\n'
+                declare -f stop_workloads copy_back
+                # shellcheck disable=SC2016
+                printf 'copy_back "$1"\n'
+            } > "$LAUNCH_DIR/copy-back.sh"
+        fi
         {
             printf '#!/usr/bin/env bash\nset -euo pipefail\numask 077\nLAUNCH_DIR=%q\n' "$LAUNCH_DIR"
             # Expand on the compute node, not while generating the script.
             # shellcheck disable=SC2016
             printf 'source "$LAUNCH_DIR/settings.sh"\n'
-            declare -f batch_main
+            declare -f publish_scratch drain_and_sync sync_before_timeout batch_main
             printf 'batch_main\n'
         } > "$LAUNCH_DIR/batch.sh"
         # JOB_NAME is supplied by the validated configuration.
@@ -459,6 +599,7 @@ case $command_name in
             "--cpus-per-task=$CPUS_PER_TASK" "--mem=$MEMORY" "--time=$TIME_LIMIT"
             "--output=$LOG_DIR/slurm-utils-%j.out" "--error=$LOG_DIR/slurm-utils-%j.err"
             "--chdir=$HOME" --export=ALL)
+        (( !migrate_scratch )) || args+=(--signal=B:USR1@300 --no-requeue)
         [[ -z $PARTITION ]] || args+=("--partition=$PARTITION")
         if [[ -n $vmem_gb ]]; then
             select_vmem_gpu
@@ -479,11 +620,32 @@ case $command_name in
         exec 9> "$state_dir/lock"
         flock -x 9
         load_current
+        if [[ -n $PROJECT_DIR ]]; then
+            # Fence startup even when a pending job starts during scancel.
+            # The batch warning and stage-in use this same shared lock.
+            exec 8> "$LAUNCH_DIR/migration.lock"
+            flock -x 8
+            if [[ -f $LAUNCH_DIR/scratch-$JOB_ID ]]; then
+                query
+                if finished; then
+                    rm -- "$state_dir/current"
+                    printf 'Allocation %s has finished. Check the batch logs for copy-back results.\n' "$JOB_ID"
+                    exit 0
+                fi
+                drain_and_sync "$JOB_ID" cancel ||
+                    fail 'Could not stop workloads and sync scratch; allocation retained. Check the error and retry cancel.'
+            fi
+        fi
         scancel "$JOB_ID" || fail 'Cancellation failed; saved state preserved'
+        if [[ -n $PROJECT_DIR ]]; then touch "$LAUNCH_DIR/cancelled"; fi
         rm -- "$state_dir/current"
         printf 'Cancelled allocation %s; scratch data retained\n' "$JOB_ID"
         ;;
     status|connect|set-up|jupyter)
+        if [[ $command_name = jupyter || $command_name = connect ]]; then
+            command -v git >/dev/null || fail 'Git is required to identify the current checkout'
+            project_dir=$(checkout_root "$caller_dir") || project_dir=$caller_dir
+        fi
         load_current; query
         scratch=''
         [[ ! -f $LAUNCH_DIR/scratch-$JOB_ID ]] || IFS= read -r scratch < "$LAUNCH_DIR/scratch-$JOB_ID"
@@ -495,6 +657,19 @@ case $command_name in
         [[ $JOB_STATE = RUNNING ]] || fail "Allocation $JOB_ID is $JOB_STATE; a running allocation is required"
         [[ -n $scratch ]] || fail 'Allocation initializing; retry shortly'
         step=(srun --jobid "$JOB_ID" --overlap --nodes=1 --ntasks=1 --export=ALL)
+        guard=()
+        if [[ -n $PROJECT_DIR ]]; then
+            [[ ! -e $LAUNCH_DIR/draining ]] || fail 'Allocation is draining for scratch copy-back'
+            # Check again inside the registered step. This also covers later
+            # tmux panes and a client that passed the login check before drain.
+            # shellcheck disable=SC2016
+            guard=(bash -c '
+                export SLURM_UTILS_DRAIN_FILE=$1
+                shift
+                [[ ! -e $SLURM_UTILS_DRAIN_FILE ]] || { echo "Allocation is draining for scratch copy-back" >&2; exit 1; }
+                exec "$@"
+            ' bash "$LAUNCH_DIR/draining")
+        fi
         if [[ $command_name = set-up ]]; then
             binary=$(readlink -f -- "${BASH_SOURCE[0]}")
             bin_dir=$(dirname -- "$binary")
@@ -505,14 +680,14 @@ case $command_name in
                 declare -f fail confirm confirm_command append_confirmed setup_main
                 printf 'setup_main "$@"\n'
             } > "$setup_script"
-            confirm_command "${step[@]}" --chdir="$caller_dir" --pty bash "$setup_script" \
+            confirm_command "${step[@]}" --chdir="$caller_dir" --pty "${guard[@]}" bash "$setup_script" \
                 "$scratch" "$caller_dir" "$bin_dir" || fail 'Setup connection declined'
-            exec "${step[@]}" --chdir="$caller_dir" --pty bash "$setup_script" "$scratch" "$caller_dir" "$bin_dir"
+            exec "${step[@]}" --chdir="$caller_dir" --pty "${guard[@]}" bash "$setup_script" "$scratch" "$caller_dir" "$bin_dir"
         fi
         if [[ $command_name = connect ]]; then
             # Positional parameters are expanded by the remote Bash.
             # shellcheck disable=SC2016
-            connection=("${step[@]}" --chdir="$caller_dir" --pty bash -c '
+            connection=("${step[@]}" --chdir="$caller_dir" --pty "${guard[@]}" bash -c '
                 # The tmux server lives on the login node, not this node.
                 unset TMUX TMUX_PANE
                 export SCRATCH_DIR=$1
@@ -529,24 +704,34 @@ case $command_name in
             fi
             exec "${connection[@]}"
         fi
+        # Legacy repo-local setup files may stage data as a side effect. They
+        # must never be sourced here, even by an allocation saved before upgrade.
+        if [[ -n $ENV_SETUP ]] && checkout_root "$(dirname -- "$ENV_SETUP")" >/dev/null; then
+            ENV_SETUP=''
+        fi
         # Positional parameters and token generation belong to the remote Bash.
         # shellcheck disable=SC2016
-        exec "${step[@]}" --chdir="$caller_dir" bash -c '
+        exec "${step[@]}" --chdir="$caller_dir" "${guard[@]}" bash -c '
             set -euo pipefail
             export SCRATCH_DIR=$1
             jupyter_command=jupyter
-            if [[ -n $2 ]]; then
+            if [[ -n $5 ]]; then source "$5"; fi
+            for venv in "$PWD/.venv" "$4/.venv"; do
+                if [[ -x $venv/bin/jupyter ]]; then
+                    export VIRTUAL_ENV="$venv"
+                    export PATH="$VIRTUAL_ENV/bin:$PATH"
+                    jupyter_command="$VIRTUAL_ENV/bin/jupyter"
+                    break
+                fi
+            done
+            if [[ $jupyter_command = jupyter && -z $5 && -n $2 ]]; then
                 source "$2"
-            elif [[ -x $4/.venv/bin/jupyter ]]; then
-                export VIRTUAL_ENV="$4/.venv"
-                export PATH="$VIRTUAL_ENV/bin:$PATH"
-                jupyter_command="$VIRTUAL_ENV/bin/jupyter"
             fi
             token=$(od -An -N32 -tx1 /dev/urandom | tr -d " \n")
             [[ ${#token} = 64 ]] || { echo "Token generation failed" >&2; exit 1; }
             export JUPYTER_TOKEN=$token
             printf "Jupyter URL (once ready): http://%s:%s/?token=%s\n" "$(hostname -f)" "$3" "$token"
             exec "$jupyter_command" notebook --no-browser --ip=0.0.0.0 --port="$3" --port-retries=0
-        ' bash "$scratch" "$ENV_SETUP" "${port_override:-$JUPYTER_PORT}" "$caller_dir"
+        ' bash "$scratch" "$ENV_SETUP" "${port_override:-$JUPYTER_PORT}" "$project_dir" "$project_env"
         ;;
 esac
