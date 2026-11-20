@@ -129,7 +129,7 @@ setup_main() {
     umask 077
     export SCRATCH_DIR=$1
     local project=$2 bin_dir=$3 zsh_path direnv installer install_command hook
-    local venv_python kernel_name
+    local venv_python kernel_name bootstrap_pip=0
     local shell_fallback=0
     cd -- "$project" || fail "Project directory is unavailable on this node: $project"
     [[ -d $bin_dir && -w $bin_dir ]] || fail "Binary directory must be shared and writable: $bin_dir"
@@ -138,17 +138,39 @@ setup_main() {
     [[ -d ${ZDOTDIR:-$HOME} ]] || fail 'ZDOTDIR must exist before set-up'
     direnv="$bin_dir/direnv"
 
+    # Use the allocation's private scratch instead of a possibly full /tmp.
+    [[ -d $SCRATCH_DIR && -w $SCRATCH_DIR ]] || fail "Job scratch is unavailable or not writable: $SCRATCH_DIR"
+    export TMPDIR=$SCRATCH_DIR
+    printf 'Using job scratch for temporary files: %s\n' "$TMPDIR"
+
     if [[ -e .venv || -L .venv ]]; then
-        [[ -f .venv/pyvenv.cfg && -r .venv/bin/activate && -x .venv/bin/python ]] ||
+        [[ -f .venv/pyvenv.cfg && -x .venv/bin/python ]] ||
             fail 'Existing .venv is incomplete; repair it or move it aside before retrying (nothing removed)'
         .venv/bin/python -c 'import sys; assert sys.prefix != sys.base_prefix' ||
             fail 'Existing .venv is not usable on this node; repair it or move it aside'
-        printf 'Reusing existing .venv\n'
+        if [[ ! -r .venv/bin/activate ]]; then
+            # venv writes activation scripts only after its implicit ensurepip
+            # succeeds. Recover that partial environment with its own Python.
+            confirm_command .venv/bin/python -m venv --without-pip .venv || fail 'Setup stopped: venv repair declined'
+            .venv/bin/python -m venv --without-pip .venv ||
+                fail 'venv repair failed; see error above. Existing .venv was retained'
+            bootstrap_pip=1
+        else
+            printf 'Reusing existing .venv\n'
+        fi
     else
         command -v python3 >/dev/null || fail 'python3 is unavailable; load a cluster Python module and retry'
-        confirm_command python3 -m venv .venv || fail 'Setup stopped: command declined'
-        python3 -m venv .venv ||
-            fail 'venv creation failed; check Python venv/ensurepip support. Any partial .venv was retained'
+        confirm_command python3 -m venv --without-pip .venv || fail 'Setup stopped: command declined'
+        python3 -m venv --without-pip .venv ||
+            fail 'venv creation failed; see error above and check Python venv support. Any partial .venv was retained'
+        bootstrap_pip=1
+    fi
+    if ((bootstrap_pip)) || ! .venv/bin/python -m pip --version >/dev/null 2>&1; then
+        # Run ensurepip directly so its underlying error is visible, rather
+        # than hidden by venv behind a generic CalledProcessError.
+        confirm_command .venv/bin/python -m ensurepip --upgrade --default-pip || fail 'Setup stopped: pip bootstrap declined; .venv retained'
+        .venv/bin/python -m ensurepip --upgrade --default-pip ||
+            fail "pip bootstrap failed; see error above and check Python ensurepip support and free space in TMPDIR=$TMPDIR. .venv retained; retry set-up"
     fi
 
     if [[ ! -x $direnv ]] || ! "$direnv" version >/dev/null 2>&1; then
@@ -204,10 +226,6 @@ setup_main() {
     venv_python="$project/.venv/bin/python"
     printf '\nOptional: install Jupyter Notebook and ipykernel in .venv for VS Code?\n'
     if confirm_command "$venv_python" -m pip install notebook ipykernel; then
-        if ! "$venv_python" -m pip --version >/dev/null 2>&1; then
-            confirm_command "$venv_python" -m ensurepip --upgrade || fail 'Jupyter installation stopped: pip bootstrap declined'
-            "$venv_python" -m ensurepip --upgrade || fail 'pip bootstrap failed; use a Python installation with ensurepip support and retry'
-        fi
         "$venv_python" -m pip install notebook ipykernel || fail 'Jupyter installation failed; check package-index access and retry set-up'
         # Stable per-project name avoids replacing another project's .venv kernel.
         kernel_name=$(printf '%s' "$project" | sha256sum)

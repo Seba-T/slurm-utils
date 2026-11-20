@@ -4,6 +4,7 @@ repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 export HOME="$work/home space" XDG_STATE_HOME="$work/state space"
+export ZDOTDIR="$HOME"
 export MOCK="$work/mock"
 export REAL_BASH
 REAL_BASH=$(command -v bash)
@@ -157,6 +158,8 @@ MOCK
 cat > "$MOCK/bin/python3" <<'MOCK'
 #!/usr/bin/env bash
 printf '%s\n' "$@" >> "$MOCK/python.args"
+[[ $TMPDIR = "$SCRATCH_DIR" && -w $TMPDIR ]] || exit 1
+[[ $* = '-m venv --without-pip .venv' ]] || exit 1
 [[ ! -e $MOCK/venv-fail ]] || exit 1
 mkdir -p .venv/bin
 printf 'home = mock\n' > .venv/pyvenv.cfg
@@ -170,9 +173,16 @@ printf '%s\n' "$0" "$@" >> "$MOCK/venv-python.args"
 if [[ $1 = -c ]]; then exit 0; fi
 case "$*" in
     '-m pip --version') [[ ! -e $MOCK/pip-missing ]] ;;
-    '-m ensurepip --upgrade')
-        [[ ! -e $MOCK/ensurepip-fail ]] || exit 1
-        rm "$MOCK/pip-missing"
+    '-m venv --without-pip .venv')
+        exec "$MOCK/bin/python3" "$@"
+        ;;
+    '-m ensurepip --upgrade'|'-m ensurepip --upgrade --default-pip')
+        [[ $TMPDIR = "$SCRATCH_DIR" && -w $TMPDIR ]] || exit 1
+        if [[ -e $MOCK/ensurepip-fail ]]; then
+            echo 'OSError: [Errno 28] No space left on device' >&2
+            exit 1
+        fi
+        rm -f "$MOCK/pip-missing"
         ;;
     '-m pip install notebook ipykernel')
         [[ ! -e $MOCK/pip-fail ]] || exit 1
@@ -215,7 +225,7 @@ chmod +x "$MOCK/bin/chsh" "$MOCK/bin/python3" "$MOCK/bin/curl"
 mkdir -p "$work/installed bin" "$work/setup project"
 cp "$repo/slurm-utils" "$work/installed bin/slurm-utils"
 setup() { (cd "$work/setup project" && "$work/installed bin/slurm-utils" set-up); }
-answers() { printf 'y\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\n'; }
+answers() { printf 'y\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\ny\n'; }
 printf 'n\n' > "$work/answers"
 expect_fail setup < "$work/answers"
 [[ ! -e $work/setup\ project/.venv ]]
@@ -232,6 +242,55 @@ rm "$MOCK/venv-fail"
 (cd "$work/setup project"; expect_fail env BASH_ENV="$work/bash-env" MOCK_MISSING_ZSH=1 "$work/installed bin/slurm-utils" set-up < "$work/answers")
 grep -q 'zsh is unavailable' "$work/output"
 [[ ! -e $MOCK/curl.args ]]
+# A fresh bootstrap failure exposes the original error and retains the venv.
+mkdir -p "$work/recovery project"
+recovery_setup() { (cd "$work/recovery project" && "$work/installed bin/slurm-utils" set-up); }
+touch "$MOCK/ensurepip-fail"
+# An inherited unusable TMPDIR must be replaced by job scratch, including spaces.
+# Expanded by the child shell.
+# shellcheck disable=SC2016
+expect_fail env TMPDIR=/nonexistent "$REAL_BASH" -c 'cd -- "$1"; "$2" set-up' bash \
+    "$work/recovery project" "$work/installed bin/slurm-utils" < "$work/answers"
+grep -q 'python3 -m venv --without-pip .venv' "$work/output"
+grep -q 'No space left on device' "$work/output"
+grep -q 'pip bootstrap failed' "$work/output"
+grep -Fq "TMPDIR=$work/scratch space/$(id -un)/123" "$work/output"
+[[ -f $work/recovery\ project/.venv/pyvenv.cfg && ! -e $MOCK/curl.args ]]
+rm "$MOCK/ensurepip-fail"
+# A retry after the new bootstrap failure detects missing pip despite activate.
+touch "$MOCK/pip-missing"
+printf 'y\nn\n' > "$work/recovery-answers"
+expect_fail recovery_setup < "$work/recovery-answers"
+grep -q 'pip bootstrap declined' "$work/output"
+[[ -e $MOCK/pip-missing && ! -e $MOCK/curl.args ]]
+# Simulate the original implicit ensurepip failure, before activate was written.
+rm "$work/recovery project/.venv/bin/activate"
+printf 'keep package data\n' > "$work/recovery project/.venv/package-sentinel"
+printf 'y\nn\n' > "$work/recovery-answers"
+expect_fail recovery_setup < "$work/recovery-answers"
+grep -q 'venv repair declined' "$work/output"
+[[ ! -e $work/recovery\ project/.venv/bin/activate && ! -e $MOCK/curl.args ]]
+# Repair failure must stop before pip or any downstream installer.
+touch "$MOCK/venv-fail"
+expect_fail recovery_setup < "$work/answers"
+grep -q 'venv repair failed' "$work/output"
+rm "$MOCK/venv-fail"
+# Accept repair and bootstrap, then decline the unrelated direnv installation.
+printf 'y\ny\ny\nn\n' > "$work/recovery-answers"
+expect_fail recovery_setup < "$work/recovery-answers"
+grep -q '.venv/bin/python -m venv --without-pip .venv' "$work/output"
+grep -q 'ensurepip --upgrade --default-pip' "$work/output"
+[[ -r $work/recovery\ project/.venv/bin/activate && ! -e $MOCK/curl.args ]]
+[[ $(cat "$work/recovery project/.venv/package-sentinel") = 'keep package data' ]]
+# Declining a fresh environment's separate bootstrap retains activation scripts.
+printf 'y\ny\nn\n' > "$work/recovery-answers"
+mkdir -p "$work/bootstrap declined project"
+# Expanded by the child shell.
+# shellcheck disable=SC2016
+expect_fail env "$REAL_BASH" -c 'cd -- "$1"; "$2" set-up' bash \
+    "$work/bootstrap declined project" "$work/installed bin/slurm-utils" < "$work/recovery-answers"
+grep -q 'pip bootstrap declined' "$work/output"
+[[ -r $work/bootstrap\ declined\ project/.venv/bin/activate && ! -e $MOCK/curl.args ]]
 # chsh failure must preserve an existing envrc and offer the SHELL fallback.
 printf '# existing project config\nexport PRESERVED=yes\n' > "$work/setup project/.envrc"
 touch "$MOCK/chsh-fail"
@@ -242,7 +301,7 @@ grep -q '^export PRESERVED=yes$' "$work/setup project/.envrc"
 grep -q '^export SHELL=' "$work/setup project/.envrc"
 grep -q '^source .venv/bin/activate$' "$work/setup project/.envrc"
 grep -q 'chsh failed' "$work/setup.output"
-grep -q 'python3 -m venv .venv' "$work/setup.output"
+grep -q 'python3 -m venv --without-pip .venv' "$work/setup.output"
 grep -q 'bin_path=' "$work/setup.output"
 grep -q 'pip install notebook ipykernel' "$work/setup.output"
 [[ $(head -n 1 "$MOCK/kernel.args") = "$work/setup project/.venv/bin/python" ]]
@@ -289,7 +348,7 @@ rm "$MOCK/kernel.args" "$MOCK/venv-python.args"
 printf 'y\ny\ny\nn\n' > "$work/answers"
 setup < "$work/answers" > "$work/setup.output" 2>&1
 [[ ! -e $MOCK/kernel.args ]]
-if grep -Fxq pip "$MOCK/venv-python.args"; then exit 1; fi
+if grep -Fxq install "$MOCK/venv-python.args"; then exit 1; fi
 grep -q 'Skipping optional Jupyter' "$work/setup.output"
 # Installing packages does not implicitly approve kernel registration.
 printf 'y\ny\ny\ny\nn\n' > "$work/answers"

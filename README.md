@@ -232,19 +232,29 @@ line, and trusting `.envrc`. Declining a required step stops setup; declining
 `chsh` offers the same fallback as a failed shell change. Earlier completed
 steps are retained, so you can rerun setup.
 
-Setup creates `.venv` with `python3 -m venv .venv`, or reuses a working existing
-environment. It stops on an incomplete `.venv` without deleting it. If Python,
-its venv support, or zsh is unavailable, load the appropriate cluster module
-or ask your administrator, then retry.
+Setup uses the allocation's private `SCRATCH_DIR` as `TMPDIR` for temporary
+files during setup and package installation, avoiding a full system `/tmp`.
+It creates `.venv` with `python3 -m venv --without-pip .venv`, then separately
+asks to run `.venv/bin/python -m ensurepip --upgrade --default-pip`. Running
+ensurepip directly displays the underlying error if pip bootstrapping fails;
+check Python ensurepip support and available space in the printed temporary
+directory before retrying.
+
+A working existing environment is reused; missing pip is bootstrapped with
+confirmation, including when retrying a failed or declined bootstrap. If a previous venv attempt left a
+valid `pyvenv.cfg` and working environment Python but no activation script,
+setup offers to finish creating the environment with its own interpreter,
+then bootstrap pip. Existing packages are preserved; nothing is deleted.
+Other incomplete or unusable `.venv` directories stop setup for manual repair.
+If Python, its venv support, or zsh is unavailable, load the appropriate cluster
+module or ask your administrator, then retry.
 
 At the end, setup asks whether to install Jupyter Notebook and ipykernel with
 `.venv/bin/python -m pip install notebook ipykernel`. These provide the notebook
 server and Python kernel for the [VS Code Jupyter extension](https://code.visualstudio.com/docs/datascience/jupyter-notebooks).
-Declining skips installation and registration and still completes setup. If
-pip is missing from an existing environment, setup asks before bootstrapping
-it with `.venv/bin/python -m ensurepip --upgrade`. Installation errors stop
-setup with a message; rerun it after fixing the environment or package-index
-access.
+Declining skips installation and registration and still completes setup.
+Installation errors stop setup with a message; rerun it after fixing the
+environment or package-index access.
 
 After installation, a separate confirmation asks to register the environment
 using its absolute Python path and `-m ipykernel install --user`. The
